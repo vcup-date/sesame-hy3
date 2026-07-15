@@ -202,6 +202,7 @@ class Agent:
         self.session_name = None
         self.title = None
         self.slots = slots_url(self.cfg.base_url)
+        self._compact_hinted = False
         self.new_session()
         threading.Thread(target=self._scheduler, daemon=True).start()
 
@@ -395,6 +396,7 @@ class Agent:
             if self.loop.goal and self.stop and self.loop.goal.status == "active":
                 self.loop.goal_pause()
             self.busy = False
+            self._compact_hint()
             self.emit({"t": "busy", "busy": False})
             self.emit({"t": "stats", **self.stats()})
 

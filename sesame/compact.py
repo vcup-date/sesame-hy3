@@ -2,7 +2,7 @@
 
 Ported from the old sesame, with one deliberate change: the old loop
 auto-compacted inside the agent loop; here compaction only runs when the user
-types /compact (the REPL prints a hint when context passes 60%). The shell
+types /compact (the REPL nudges you once context passes 85%). The shell
 stays loopless — this is a REPL-layer, user-invoked transform.
 """
 

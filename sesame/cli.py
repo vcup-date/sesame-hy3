@@ -902,6 +902,7 @@ def paste_label(pid, text):
     return f"[paste #{pid} · {lines} lines · {preview}]"
 
 
+COMPACT_HINT_AT = 0.85       # nudge to /compact once context passes this
 DIALOG_COMMANDS = {"/model", "/provider", "/resume", "/effort"}  # open a picker; not loopable
 
 COMMANDS = ["/help", "/goal", "/loop", "/model", "/provider", "/tools", "/undo", "/compact",
@@ -967,6 +968,7 @@ class App:
         self._carry = ""             # text you had typed when the prompt restarted
         self.printer = Printer(self)
         self.show_thinking = cfg._raw.get("showThinking", False)
+        self._compact_hinted = False
         self.session_name = None
         self.pastes = {}             # id -> the text you pasted
         self.paste_n = 0
@@ -1383,6 +1385,7 @@ class App:
             out(red(f"✖ {exc}"))
         finally:
             self.printer.end_of_turn()   # blank line before your next ❯
+            self._maybe_compact_hint()
             self.busy = False
             self.spin.end()
             self._redraw(full=True)   # the prompt restarts; the loop parks it
@@ -1395,6 +1398,19 @@ class App:
             out(green(f"✓ goal complete: {g.summary}"))
         elif g.status == "budget_limited":
             out(yellow(f"⏸ goal stopped after {g.turns} turns · /goal resume to keep going"))
+
+    def _maybe_compact_hint(self):
+        """Nudge to /compact once context is most of the way full — once per fill,
+        not every turn (hysteresis: warn at 85%, re-arm once it drops below 70%)."""
+        w = self.cfg.context_window
+        if not w:
+            return
+        pct = self.loop.stats.context_tokens / w
+        if pct >= COMPACT_HINT_AT and not self._compact_hinted:
+            self._compact_hinted = True
+            out(yellow(f"⧉ context {pct * 100:.0f}% full · /compact to free it"))
+        elif pct < 0.70:
+            self._compact_hinted = False
 
     def request_confirm(self, name):
         """Called from the worker thread. Blocks it until you answer."""
@@ -1566,6 +1582,7 @@ class App:
                     out(dim(f"  {note}"))
         elif cmd == "/compact":
             did = self.loop.compact_now(self.printer)
+            self._compact_hinted = False
             out(dim("compacted" if did else "nothing to compact yet"))
         elif cmd == "/effort":
             self._pick_effort(arg.strip().lower())

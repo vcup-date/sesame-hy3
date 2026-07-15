@@ -1249,6 +1249,26 @@ check("a loop older than 7 days is expired", _old.expired())
 check("a fresh loop is not expired, ~7 days left",
       not _new.expired() and (_new.expires_in() + 86399) // 86400 == 7)
 
+# 10n. the /compact nudge: fires once when context passes 85%, re-arms after it drops.
+if _cli is not None:
+    import io as _io, contextlib as _ctx
+    _app = _cli.App.__new__(_cli.App)
+    _app._compact_hinted = False
+    _app.loop = type("L", (), {"stats": type("S", (), {"context_tokens": 0})()})()
+    _app.cfg = type("C", (), {"context_window": 1000})()
+
+    def _hint_at(pct):
+        _app.loop.stats.context_tokens = int(pct * 1000)
+        b = _io.StringIO()
+        with _ctx.redirect_stdout(b):
+            _app._maybe_compact_hint()
+        return "/compact" in b.getvalue()
+
+    check("no compact nudge at half full", not _hint_at(0.50))
+    check("compact nudge fires when context passes 85%", _hint_at(0.86))
+    check("it does not nag every turn once shown", not _hint_at(0.92))
+    check("it re-arms after context drops", not _hint_at(0.60) and _hint_at(0.88))
+
 # 11. a keyless local endpoint is a valid setup: run.sh must not force setup on it
 import config as _config                          # noqa: E402
 
