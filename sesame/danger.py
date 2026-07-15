@@ -8,18 +8,21 @@ exactly how the prompts that matter get waved through. So the question is never
   destructive     rm -rf, dd, mkfs, shred, git reset --hard, git clean -f, DROP TABLE…
   irreversible    force push, publish, docker push, kubectl delete
   privileged      sudo, writes to /dev, recursive chmod/chown, moves into system dirs
-  overwriting     replacing an existing non-empty file (creating one is fine)
+  unrecoverable   overwriting a file too big for /undo to snapshot
   sensitive       .env, *.key, *.pem, id_rsa, .netrc — even when new
   remote code     curl | sh
   persistent      a global memory write (it enters every future system prompt)
 
-Everything else — mkdir, a new file (anywhere), an edit, a normal build/test
-command — just runs, and /undo can roll back any file it touched. Location does
-not make a write dangerous; destroying existing content does.
+Writing files is not gated. A new file, an overwrite, an edit — all are snapshotted
+before they run, so /undo restores them, and an agent that touches many files would
+otherwise drown you in prompts. The only write still worth asking about is one /undo
+cannot reverse: a file larger than checkpoint's snapshot limit.
 """
 
 import re
 from pathlib import Path
+
+import checkpoint
 
 _PATTERNS = [
     (r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\b", "recursive force delete (rm -rf)"),
@@ -136,15 +139,18 @@ def check(name, args):
         p = Path(str(args.get("path", ""))).expanduser()
         if _sensitive(p):
             return f"modifies a sensitive file ({p.name})"
-        # Creating a new file is not a dangerous act, wherever it lives: nothing is
-        # destroyed and /undo deletes it again. Only REPLACING an existing file's
-        # contents is worth a prompt — and a write overwrites the whole file,
-        # while an edit is a surgical, undoable change. So: overwrite prompts,
-        # create and edit do not. (Location does not decide this; destruction does.)
-        if name == "write" and p.is_file() and p.stat().st_size > 0:
-            if p.suffix.lower() in (".db", ".sqlite", ".sqlite3"):
-                return "overwrites a database file"
-            return f"overwrites existing file {p.name}"
+        # A write or edit is not gated: you asked for it, and every one is
+        # snapshotted before it runs, so /undo puts the file back. Overwriting is
+        # not "hard to undo", and an agent touches many files, so a prompt per file
+        # is pure noise. The one file write that IS hard to undo is one too large to
+        # snapshot (over checkpoint's limit): that overwrite cannot be reversed, so
+        # it is the only one still worth a prompt.
+        try:
+            if p.is_file() and p.stat().st_size > checkpoint.MAX_FILE_BYTES:
+                mb = p.stat().st_size // (1024 * 1024)
+                return f"overwrites {p.name} ({mb} MB) — too large for /undo to restore"
+        except OSError:
+            pass
     if name == "remember" and args.get("scope", "global") != "session":
         return "adds a permanent item to every future system prompt"
     if name == "forget" and args.get("scope", "global") != "session":

@@ -93,15 +93,22 @@ with tempfile.TemporaryDirectory() as td:
               danger.check_bash("echo x | tee existing.py") is not None)
         check("> /dev/null does not prompt",
               danger.check_bash("cmd > /dev/null 2>&1") is None)
-        # location does not make a write dangerous; destroying content does
-        check("creating a new file out of bounds does NOT prompt",
+        # writes are undoable (snapshotted), so they do not gate; the agent
+        # touches many files and a prompt each would be pure noise
+        check("creating a new file does NOT prompt",
               danger.check("write", {"path": "/tmp/no-such-dir-xyz/brand_new.html"}) is None)
-        check("overwriting an existing file DOES prompt (wherever it is)",
-              danger.check("write", {"path": "/etc/hosts"}) is not None)
-        check("editing a file out of bounds does NOT prompt (undo covers it)",
+        check("overwriting an existing (small) file does NOT prompt — /undo covers it",
+              danger.check("write", {"path": "/etc/hosts"}) is None)
+        check("editing a file does NOT prompt (undo covers it)",
               danger.check("edit", {"path": "/tmp/no-such-dir-xyz/whatever.py"}) is None)
         check("writing a sensitive file still prompts, even new",
               danger.check("write", {"path": "/tmp/anything/.env"}) is not None)
+        # the one write /undo cannot reverse still prompts
+        import checkpoint as _ckpt
+        _big = Path(td) / "big.bin"
+        _big.write_bytes(b"x" * (_ckpt.MAX_FILE_BYTES + 1))
+        check("overwriting a file too big for /undo prompts",
+              danger.check("write", {"path": str(_big)}) is not None)
     finally:
         os.chdir(old)
 
