@@ -68,9 +68,17 @@ class Config:
     # ── derived views the Loop hands to the shell ────────────────────────────
     @property
     def effective_max_tokens(self):
+        base = self.max_output_tokens
         if self.thinking_budget:
-            return max(self.max_output_tokens, self.thinking_budget + 4096)
-        return self.max_output_tokens
+            base = max(base, self.thinking_budget + 4096)
+        # A local model is free and has a huge context, so a small output cap is
+        # pointless: it just chops a big file write off in the middle. Let it run
+        # up to a generous fraction of the window (leaving room for the prompt),
+        # so "write the whole thing" works however big the thing is.
+        if providers.is_local(self.base_url):
+            room = max(0, self.context_window - 16000)
+            base = max(base, min(room, 131072))
+        return base
 
     @property
     def api(self):

@@ -452,6 +452,7 @@ def _stream(*, transcript, system, tools, api, budget, emit):
                         emit({"type": "text", "text": d["text"]})
                     elif d["type"] == "input_json_delta":
                         partial_json[i] += d["partial_json"]
+                        emit({"type": "tick"})   # so esc can interrupt a long write
                     elif d["type"] == "signature_delta":
                         b["signature"] = b.get("signature", "") + d["signature"]
                     elif d["type"] == "redacted_thinking_delta":
@@ -603,6 +604,12 @@ def _openai_request(*, transcript, system, tools, api, budget, emit, echo_reason
                         emit({"type": "block_start", "block_type": "text"})
                     text += delta["content"]
                     emit({"type": "text", "text": delta["content"]})
+                if delta.get("tool_calls"):
+                    # A big tool call (writing a whole file) streams as argument
+                    # deltas and emits nothing, so the stop flag, which is only read
+                    # inside emit(), was never checked: esc could not interrupt a long
+                    # write. Tick once per chunk so the stop check runs.
+                    emit({"type": "tick"})
                 for tcd in delta.get("tool_calls") or []:
                     i = tcd.get("index", 0)
                     slot = calls.setdefault(i, {"id": None, "name": "", "arguments": ""})

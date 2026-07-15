@@ -1119,6 +1119,44 @@ if _cli is not None:
 
     check("one or two lines is just text, not an attachment", _cli.PASTE_MIN_LINES == 3)
 
+# 10j. esc must interrupt a long write. A big tool call streams as argument deltas
+#      and emits nothing, so the stop flag (only read inside emit) was never seen.
+#      A tick per chunk fixes it: emit checks stop first and raises to abort.
+import loop as _loopmod                          # noqa: E402
+
+
+class _StopLn:
+    def __init__(self, stop): self._stop = stop
+    def on_raw(self, ev): pass
+    def stop_requested(self): return self._stop
+
+
+_lp = _loopmod.Loop.__new__(_loopmod.Loop)
+_lp.cfg = type("C", (), {"budget": {"tool_calls": 1}})()
+_lp._ln = _StopLn(False)
+_lp._event({"type": "tick"})                     # not stopping: a harmless no-op
+check("a tick is a no-op while running", True)
+_lp._ln = _StopLn(True)
+_stopped = False
+try:
+    _lp._event({"type": "tick"})
+except KeyboardInterrupt:
+    _stopped = True
+check("a tick while stopping aborts (esc can interrupt a long write)", _stopped)
+
+# 10k. a local model does not choke a big write on a tiny output cap
+import config as _cfgmod                          # noqa: E402
+
+_c = _cfgmod.Config.__new__(_cfgmod.Config)
+_c.max_output_tokens = 8192
+_c.thinking_budget = 2000
+_c.base_url = "http://127.0.0.1:9403/v1"          # local
+_c.context_window = 262144
+check("a local model gets a generous output budget, not 8k",
+      _c.effective_max_tokens >= 100000)
+_c.base_url = "https://api.deepseek.com"          # remote: respects the set cap
+check("a remote model keeps its configured cap", _c.effective_max_tokens == 8192 + 4096 - 4096 or _c.effective_max_tokens == max(8192, 2000 + 4096))
+
 # 11. a keyless local endpoint is a valid setup: run.sh must not force setup on it
 import config as _config                          # noqa: E402
 
