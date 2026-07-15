@@ -1189,6 +1189,56 @@ check("a write is covered by an always-edit rule for the same place",
 check("bash is NOT covered by a write rule",
       not _proj.prefix_allowed(_perms, "bash", {"command": "rm -rf /"}))
 
+# 10m. /goal and /loop: the two drivers that keep the agent working on their own.
+import goals as _goals                            # noqa: E402
+
+for _t, _exp in [("5m", 300), ("30s", 30), ("2h", 7200), ("10", 600), ("", None), ("x", None)]:
+    check(f"interval {_t!r} parses", _goals.parse_interval(_t) == _exp)
+
+_g = _goals.Goal("build it", budget=1000, base_out=0)
+check("a fresh goal is active", _g.status == "active")
+check("goal_next returns a continuation with the objective in it",
+      "build it" in (_g.next_prompt(200) or "") and _g.turns == 1)
+check("goal stops when the token budget is spent",
+      _g.next_prompt(1500) is None and _g.status == "budget_limited")
+
+_g2 = _goals.Goal("x")
+_g2.status = "complete"
+check("a complete goal does not continue", _g2.next_prompt(0) is None)
+
+_g3 = _goals.Goal("y")
+for _ in range(_goals.MAX_GOAL_TURNS):
+    _g3.next_prompt(0)
+check("a goal cannot run past the hard turn cap",
+      _g3.next_prompt(0) is None and _g3.status == "budget_limited")
+
+_j = _goals.LoopJob(300, "poll", clock=lambda: 1000.0)
+check("a loop job is due at its scheduled time", _j.due(1000.0) and not _j.due(999.0))
+_j.fired(1000.0)
+check("firing a loop advances it by one interval", _j.count == 1 and _j.next_at == 1300.0)
+
+check("goal and loop survive a round trip through their dicts",
+      _goals.Goal.from_dict(_g.to_dict()).objective == "build it"
+      and _goals.LoopJob.from_dict(_j.to_dict()).interval == 300)
+
+# the model-facing tools exist and drive the state (the "internal skill")
+_lp = _loopmod.Loop.__new__(_loopmod.Loop)
+_lp.goal = None
+_lp.loop_job = None
+_lp.session = None
+_lp.stats = _loopmod.Stats()
+_gt = _lp._goal_tools()
+check("the model gets set_goal, goal_done, set_loop tools",
+      [t["name"] for t in _gt] == ["set_goal", "goal_done", "set_loop"])
+_by = {t["name"]: t for t in _gt}
+check("set_goal via the tool starts a goal",
+      _by["set_goal"]["execute"]({"objective": "do X"})["ok"] and _lp.goal.status == "active")
+check("goal_done via the tool completes it",
+      _by["goal_done"]["execute"]({"summary": "did X"})["ok"] and _lp.goal.status == "complete")
+check("set_loop via the tool schedules it",
+      _by["set_loop"]["execute"]({"prompt": "poll", "every": "1m"})["ok"]
+      and _lp.loop_job.interval == 60)
+
 # 11. a keyless local endpoint is a valid setup: run.sh must not force setup on it
 import config as _config                          # noqa: E402
 

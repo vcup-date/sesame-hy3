@@ -19,6 +19,7 @@ import checkpoint
 import compact as compaction
 import context as ctx
 import danger
+import goals
 import log
 import models
 import project
@@ -79,9 +80,12 @@ class Loop:
         self._lock = threading.Lock()
         self._steer = queue.Queue()  # messages you typed while it was working
         self._session_name = None
+        self.goal = None             # a durable objective the agent keeps pursuing
+        self.loop_job = None         # a prompt re-run on an interval
         browser.STATE["headed"] = cfg.browser_headed
         log.configure(cfg.log_file)
         self.tools = (TOOLS + browser.TOOLS + make_memory_tools(self.memory)
+                      + self._goal_tools()
                       + [make_subagent_tool(tools=TOOLS, api=self.cfg.api,
                                             budget=self.cfg.budget,
                                             on_event=self._sub_event)])
@@ -315,6 +319,114 @@ class Loop:
         self.stats.cost_usd += models.cost(self.cfg.model, spent)
         self.stats.context_tokens = ctx.estimate_tokens(self.messages, self.system())
 
+    # ── goal: a durable objective the agent keeps pursuing across turns ──────
+    def set_goal(self, objective, budget=None):
+        self.goal = goals.Goal(objective, budget=budget, base_out=self.stats.output_tokens)
+        self._save()
+        return self.goal
+
+    def goal_next(self):
+        """After a turn: the next continuation prompt, or None if the goal is done,
+        out of budget, paused, or cleared. Updates the goal's status."""
+        if not self.goal:
+            return None
+        p = self.goal.next_prompt(self.stats.output_tokens)
+        self._save()
+        return p
+
+    def goal_complete(self, summary=""):
+        if self.goal:
+            self.goal.status = "complete"
+            self.goal.summary = summary
+            self._save()
+
+    def goal_pause(self):
+        if self.goal and self.goal.status == "active":
+            self.goal.status = "paused"
+            self._save()
+
+    def goal_resume(self):
+        if self.goal and self.goal.status in ("paused", "budget_limited"):
+            self.goal.status = "active"
+            self._save()
+            return True
+        return False
+
+    def goal_clear(self):
+        had = self.goal is not None
+        self.goal = None
+        self._save()
+        return had
+
+    # ── loop: a prompt re-run on an interval ─────────────────────────────────
+    def set_loop(self, interval, prompt):
+        self.loop_job = goals.LoopJob(interval, prompt)
+        self._save()
+        return self.loop_job
+
+    def loop_clear(self):
+        had = self.loop_job is not None
+        self.loop_job = None
+        self._save()
+        return had
+
+    def loop_due(self, now):
+        return bool(self.loop_job) and self.loop_job.due(now)
+
+    # ── the tools the model can call to drive these itself ───────────────────
+    def _goal_tools(self):
+        def _set_goal(inp):
+            obj = str(inp.get("objective") or "").strip()
+            if not obj:
+                return {"ok": False, "content": "objective is required"}
+            budget = inp.get("budget_tokens")
+            self.set_goal(obj, int(budget) if budget else None)
+            return {"ok": True, "content": f"Goal set. I will keep working toward it, one "
+                                           f"step per turn, until it is done: {obj}"}
+
+        def _goal_done(inp):
+            if not self.goal or self.goal.status not in ("active", "paused"):
+                return {"ok": False, "content": "there is no active goal to complete"}
+            self.goal_complete(str(inp.get("summary") or "done"))
+            return {"ok": True, "content": "Goal marked complete."}
+
+        def _set_loop(inp):
+            prompt = str(inp.get("prompt") or "").strip()
+            if not prompt:
+                return {"ok": False, "content": "prompt is required"}
+            secs = goals.parse_interval(str(inp.get("every") or "")) or goals.DEFAULT_LOOP_SECONDS
+            self.set_loop(secs, prompt)
+            return {"ok": True, "content": f"Loop set: every {secs}s I will run: {prompt}"}
+
+        return [
+            {"name": "set_goal", "read_only": False,
+             "description": ("Set a durable objective to keep working toward across many turns. "
+                             "After each turn you will be asked to continue until you call "
+                             "goal_done. Use for a big task with a clear finish (a migration, a "
+                             "feature, a game). Optional budget_tokens caps the output spend."),
+             "input_schema": {"type": "object",
+                              "properties": {"objective": {"type": "string"},
+                                             "budget_tokens": {"type": "integer"}},
+                              "required": ["objective"]},
+             "execute": _set_goal},
+            {"name": "goal_done", "read_only": False,
+             "description": ("Declare the current goal complete (or report that you are blocked). "
+                             "Only call this when the objective is actually achieved, or you truly "
+                             "cannot proceed. It stops the goal loop."),
+             "input_schema": {"type": "object", "properties": {"summary": {"type": "string"}},
+                              "required": ["summary"]},
+             "execute": _goal_done},
+            {"name": "set_loop", "read_only": False,
+             "description": ("Re-run a prompt on an interval, e.g. every '10m'. Use for polling or "
+                             "a periodic check. It repeats until the user stops it."),
+             "input_schema": {"type": "object",
+                              "properties": {"prompt": {"type": "string"},
+                                             "every": {"type": "string",
+                                                       "description": "e.g. 30s, 5m, 1h"}},
+                              "required": ["prompt"]},
+             "execute": _set_loop},
+        ]
+
     # ── session (markdown, append-only) ──────────────────────────────────────
     def open(self, name):
         """Name the session but do NOT create the file yet — launching sesame and
@@ -334,7 +446,12 @@ class Loop:
     def _save(self):
         if self.session:
             try:
-                self.session.stats(vars(self.stats))
+                data = dict(vars(self.stats))
+                if self.goal:
+                    data["goal"] = self.goal.to_dict()
+                if self.loop_job:
+                    data["loop"] = self.loop_job.to_dict()
+                self.session.stats(data)
             except OSError:
                 pass
 
@@ -353,12 +470,16 @@ class Loop:
         self.messages[:] = validate_and_repair(data["messages"])
         st = data["stats"]
         self.stats = Stats(**{k: st.get(k, 0) for k in vars(Stats()) if k in st})
+        self.goal = goals.Goal.from_dict(st["goal"]) if st.get("goal") else None
+        self.loop_job = goals.LoopJob.from_dict(st["loop"]) if st.get("loop") else None
         self.session = tx.Session(data["name"], self.cfg.model)
         return True
 
     def reset(self):
         self.messages.clear()
         self.stats = Stats()
+        self.goal = None
+        self.loop_job = None
         self.memory.clear_session()
         if self.session:
             try:

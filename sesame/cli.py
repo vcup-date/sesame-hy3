@@ -38,6 +38,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 
 import checkpoint
+import goals
 import models
 import providers
 import transcript as tx
@@ -901,11 +902,13 @@ def paste_label(pid, text):
     return f"[paste #{pid} · {lines} lines · {preview}]"
 
 
-COMMANDS = ["/help", "/model", "/provider", "/tools", "/undo", "/compact", "/effort", "/think",
-            "/save", "/resume", "/sessions", "/memory", "/permissions", "/confirm", "/init",
-            "/copy", "/clear", "/quit"]
+COMMANDS = ["/help", "/goal", "/loop", "/model", "/provider", "/tools", "/undo", "/compact",
+            "/effort", "/think", "/save", "/resume", "/sessions", "/memory", "/permissions",
+            "/confirm", "/init", "/copy", "/clear", "/quit"]
 
 HELP_ROWS = [
+    ("/goal <objective>", "keep working toward it until done  (pause | resume | clear)"),
+    ("/loop [5m] <prompt>", "re-run a prompt on an interval  (stop)"),
     ("/model", "models, saved profiles, your own endpoint: all in one picker"),
     ("/provider", "switch provider"),
     ("/tools", "what it can do"),
@@ -1172,6 +1175,11 @@ class App:
         name = f"{self.session_name} · " if self.session_name else ""
         prof = f"{self.cfg.profile} · " if self.cfg.profile else ""
         info = f"{name}{prof}{self.cfg.model} · {used} · {cost} · turn {st.turns}"
+        g = self.loop.goal
+        if g and g.status in ("active", "paused"):
+            info += f"  ·  ⊙ goal[{g.status[:4]}] t{g.turns}"
+        if self.loop.loop_job:
+            info += f"  ·  ↻ loop {self.loop.loop_job.count}×"
         hint = "esc stop · type to steer" if self.busy else "enter send · / commands"
         return FormattedText([("class:rule", "─" * self._width() + "\n"),
                               ("class:status", f"  {info}"),
@@ -1249,16 +1257,104 @@ class App:
         self._redraw(full=True)          # the prompt grows: reflow
         threading.Thread(target=self._work, args=(text,), daemon=True).start()
 
+    # ── goal & loop (Codex /goal, Claude Code /loop) ─────────────────────────
+    def _cmd_goal(self, arg):
+        a = arg.strip()
+        g = self.loop.goal
+        if not a:
+            if not g:
+                out(dim("no goal. /goal <objective> to set one, and it keeps working toward it"))
+                return
+            used = g.used(self.loop.stats.output_tokens)
+            meter = f" · {tok(used)}/{tok(g.budget)} tok" if g.budget else f" · {tok(used)} tok"
+            out(f"{bold('goal')} [{g.status}] · turn {g.turns}{meter}")
+            out(dim(f"  {g.objective}"))
+            return
+        if a == "pause":
+            self.loop.goal_pause(); out(dim("goal paused")); return
+        if a == "clear":
+            out(dim("goal cleared") if self.loop.goal_clear() else dim("no goal")); return
+        if a == "resume":
+            if not self.loop.goal_resume():
+                out(dim("no paused goal to resume")); return
+            nxt = self.loop.goal_next()
+            if nxt:
+                out(dim("resuming goal…")); self.turn(nxt)
+            return
+        self.loop.set_goal(a)
+        out(green(f"⊙ goal set — I will keep working until it is done:"))
+        out(dim(f"  {a}"))
+        self.turn(a)                     # start pursuing right away
+
+    def _cmd_loop(self, arg):
+        a = arg.strip()
+        j = self.loop.loop_job
+        if not a:
+            if not j:
+                out(dim("no loop. /loop [interval] <prompt>, e.g. /loop 5m check the build"))
+                return
+            out(f"{bold('loop')} every {j.interval}s · ran {j.count}×")
+            out(dim(f"  {j.prompt}"))
+            return
+        if a in ("stop", "clear", "off"):
+            out(dim("loop stopped") if self.loop.loop_clear() else dim("no loop")); return
+        parts = a.split(None, 1)
+        secs = goals.parse_interval(parts[0])
+        if secs is not None and len(parts) > 1:
+            prompt = parts[1]
+        else:
+            secs, prompt = goals.DEFAULT_LOOP_SECONDS, a
+        self.loop.set_loop(secs, prompt)
+        out(green(f"↻ loop set — every {secs}s:"))
+        out(dim(f"  {prompt}"))
+        self.turn(prompt)                # run the first one now; the scheduler does the rest
+
+    def _scheduler(self):
+        """Fire a due loop job when idle. app.exit(RESTART) inside turn() re-draws the
+        prompt from here the same way a finished turn does, so this is safe from a
+        background thread."""
+        while True:
+            time.sleep(2)
+            if self.busy or self.pending or not self.loop.loop_job:
+                continue
+            try:
+                typing = self.session.app.current_buffer.text.strip()
+            except Exception:
+                typing = ""
+            if typing:                   # do not interrupt something you are typing
+                continue
+            if self.loop.loop_due(time.monotonic()):
+                j = self.loop.loop_job
+                j.fired(time.monotonic())
+                self.loop._save()
+                out(dim(f"↻ loop #{j.count}"))
+                self.turn(j.prompt)
+
+    def _run_with_steers(self, text):
+        """One turn, then anything you typed while it worked, until the queue drains."""
+        self.loop.run(text, self.printer)
+        leftover = self.loop.pending_steer()
+        while leftover and not self.stop:
+            out(dim("it finished before reading your message, running it now"))
+            self.loop.run(leftover, self.printer)
+            leftover = self.loop.pending_steer()
+
     def _work(self, text):
         try:
-            self.loop.run(text, self.printer)
-            leftover = self.loop.pending_steer()
-            while leftover and not self.stop:
-                out(dim("it finished before reading your message, running it now"))
-                self.loop.run(leftover, self.printer)
-                leftover = self.loop.pending_steer()
+            self._run_with_steers(text)
+            # goal: keep pursuing the objective, turn after turn, until the model
+            # calls goal_done, a budget runs out, or you pause or stop it.
+            nxt = self.loop.goal_next()
+            while nxt and not self.stop:
+                out(dim(f"↻ goal · continuing (turn {self.loop.goal.turns})"))
+                self._run_with_steers(nxt)
+                nxt = self.loop.goal_next()
+            self._report_goal()
         except KeyboardInterrupt:
             out(dim("stopped"))
+            if self.loop.goal and self.loop.goal.status == "active":
+                self.loop.goal_pause()
+                out(dim("goal paused · /goal resume to continue"))
         except Exception as exc:
             out(red(f"✖ {exc}"))
         finally:
@@ -1266,6 +1362,15 @@ class App:
             self.busy = False
             self.spin.end()
             self._redraw(full=True)   # the prompt restarts; the loop parks it
+
+    def _report_goal(self):
+        g = self.loop.goal
+        if not g or self.stop:
+            return
+        if g.status == "complete":
+            out(green(f"✓ goal complete: {g.summary}"))
+        elif g.status == "budget_limited":
+            out(yellow(f"⏸ goal stopped after {g.turns} turns · /goal resume to keep going"))
 
     def request_confirm(self, name):
         """Called from the worker thread. Blocks it until you answer."""
@@ -1411,6 +1516,10 @@ class App:
             for k, d in KEY_ROWS:
                 out(f"  {cyan(k)}{' ' * (w - len(k))}{dim(d)}")
             out()
+        elif cmd == "/goal":
+            self._cmd_goal(arg)
+        elif cmd == "/loop":
+            self._cmd_loop(arg)
         elif cmd == "/model":
             self._pick_model(arg)
         elif cmd == "/provider":
@@ -1801,6 +1910,7 @@ class App:
             out(dim("a previous session was interrupted · /resume to pick it up"))
             out()
         threading.Thread(target=self._animate, daemon=True).start()
+        threading.Thread(target=self._scheduler, daemon=True).start()
         self._to_bottom()
         while True:
             try:
