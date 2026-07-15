@@ -5,7 +5,8 @@ dangerous — asking about it just trains you to hit "y" without reading, which 
 exactly how the prompts that matter get waved through. So the question is never
 "does this tool write?" but "is this hard to undo?":
 
-  destructive     rm -rf, dd, mkfs, shred, git reset --hard, git clean -f, DROP TABLE…
+  destructive     dd, mkfs, shred, git reset --hard, git clean -f, DROP TABLE…
+  catastrophic rm rm of /, ~, a system dir, a parent (..), or the whole tree (. or *)
   irreversible    force push, publish, docker push, kubectl delete
   privileged      sudo, writes to /dev, recursive chmod/chown, moves into system dirs
   unrecoverable   overwriting a file too big for /undo to snapshot
@@ -19,22 +20,22 @@ otherwise drown you in prompts. The only write still worth asking about is one /
 cannot reverse: a file larger than checkpoint's snapshot limit.
 """
 
+import os
 import re
+import shlex
 from pathlib import Path
 
 import checkpoint
 
 _PATTERNS = [
-    (r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\b", "recursive force delete (rm -rf)"),
-    (r"\brm\s+-[a-z]*r\b", "recursive delete (rm -r)"),
-    (r"\brm\b[^|;&]*--(force|recursive)", "force/recursive delete (rm --force/--recursive)"),
-    (r"(?:^|[;&|]\s*|\bsudo\s+)rm\s+\S", "deletes files (rm)"),
-    # rm reached indirectly — the plain `rm` rule above only sees it at the start
-    # of a command, so these three slipped through entirely
+    # rm itself is handled by _rm_danger (below): deleting a named subdirectory like
+    # build/ or node_modules is routine and does not prompt, only deleting a system,
+    # home, root, or the whole working tree does. These are the rm forms _rm_danger
+    # cannot bound, so they still prompt: rm reached through find/xargs (the target
+    # is data-dependent), and the python equivalents.
     (r"-exec\s+(sudo\s+)?rm\b", "deletes files (find -exec rm)"),
     (r"\bxargs\b[^|;&]*\brm\b", "deletes files (xargs rm)"),
-    (r"\b(shutil\.rmtree|os\.remove|os\.unlink|\.unlink\(\))", "deletes files (python)"),
-    (r"(?:^|[;&|]\s*)(unlink|rmdir)\s+\S", "deletes files"),
+    (r"\b(shutil\.rmtree|os\.remove|os\.unlink)", "deletes files (python)"),
     # discards YOUR uncommitted work — no undo, and easy to type by accident
     (r"\bgit\s+(checkout|restore)\s+(--\s+)?[.*]", "discards uncommitted changes"),
     (r"\bgit\s+branch\s+-D\b", "force-deletes a branch"),
@@ -104,7 +105,71 @@ def _clobbers(command):
     return None
 
 
+# rm gates on WHAT it deletes, not that it deletes. Removing a named subdirectory
+# (build, node_modules, dist) is routine and bounded; removing a system directory,
+# your home, the root, the whole working tree (`.`, `*`), or a parent (`..`) is the
+# catastrophe worth a prompt. `>>`-style scale is not the signal — a name is.
+_SYSTEM_TOPS = {"bin", "sbin", "usr", "etc", "var", "lib", "lib64", "opt", "boot",
+                "sys", "proc", "dev", "root", "System", "Library", "Applications",
+                "private", "cores", "Volumes", "Network"}
+_HOME_ROOTS = {"Users", "home"}                  # /Users/<name>, /home/<name> are homes
+_CRED_DIRS = {".ssh", ".gnupg", ".aws", ".kube", ".docker", ".config"}
+
+
+def _rm_target_dangerous(raw):
+    t = raw.strip()
+    if not t:
+        return True
+    if "$" in t or "`" in t:                     # a variable/subshell could be anything
+        return True
+    if t in ("*", "/*", "./*", "~/*", "~", "~/", "/", ".", "./", "..", "../"):
+        return True
+    if t.startswith("../") or "/.." in t or t.endswith("/.."):
+        return True
+    exp = Path(os.path.expanduser(t))
+    try:
+        if exp == Path.home() or exp.resolve() == Path.home().resolve():
+            return True
+    except OSError:
+        pass
+    if set(exp.parts) & _CRED_DIRS:              # ~/.ssh and friends, wherever they sit
+        return True
+    if exp.is_absolute():
+        parts = exp.parts[1:]
+        if not parts:
+            return True                          # "/"
+        top = parts[0]
+        if top in _HOME_ROOTS and len(parts) <= 2:
+            return True                          # /Users or /Users/<name>: a whole home
+        if top in _SYSTEM_TOPS:                  # anything under /etc, /usr, /System, …
+            return True
+    return False
+
+
+def _rm_danger(command):
+    for seg in re.split(r"\|\||&&|[;|&\n]", command):
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            toks = seg.split()
+        i = 0
+        while i < len(toks) and toks[i] in ("sudo", "env", "time", "nice", "nohup", "command"):
+            i += 1
+        if i >= len(toks) or os.path.basename(toks[i]) != "rm":
+            continue
+        targets = [a for a in toks[i + 1:] if not a.startswith("-")]
+        if not targets:
+            return "deletes with no target (rm)"
+        for t in targets:
+            if _rm_target_dangerous(t):
+                return f"deletes a system, home, or root path (rm {t})"
+    return None
+
+
 def check_bash(command):
+    rm = _rm_danger(command)
+    if rm:
+        return rm
     for pattern, reason in _PATTERNS:
         if re.search(pattern, command, re.IGNORECASE):
             return reason
