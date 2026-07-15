@@ -66,10 +66,6 @@ import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)
 PY
 ok "python3 $(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
 
-# the hf CLI (for the model download). Install into the agent venv later if missing.
-HF=""
-for cand in hf huggingface-cli; do command -v "$cand" >/dev/null 2>&1 && { HF="$cand"; break; }; done
-
 # ── 2. build the engine ──────────────────────────────────────────────────────
 c "3. inference engine (hy_v3-patched llama.cpp)"
 if [ -x "$SERVER" ]; then
@@ -86,8 +82,18 @@ else
   ok "engine built"
 fi
 
-# ── 3. download the model ────────────────────────────────────────────────────
-c "4. model (Hy3-295B, IQ1_M, 85 GB)"
+# ── 3. the agent's python env (also gives us the model downloader) ───────────
+c "4. agent"
+if [ ! -d "$VENV" ]; then
+  python3 -m venv --system-site-packages "$VENV"
+fi
+PY="$VENV/bin/python"
+"$PY" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
+"$PY" -m pip install --quiet prompt_toolkit huggingface_hub || die "could not install dependencies"
+ok "agent ready"
+
+# ── 4. download the model ────────────────────────────────────────────────────
+c "5. model (Hy3-295B, IQ1_M, 85 GB)"
 mkdir -p "$MODELS"
 if [ -f "$MODEL" ] && [ "$(stat -f%z "$MODEL")" = "$MODEL_BYTES" ]; then
   ok "already present ($MODEL)"
@@ -101,27 +107,19 @@ else
     warn "found an existing copy at $FOUND — linking it instead of downloading"
     ln -sfn "$FOUND" "$MODEL"; ok "linked"
   else
-    [ -n "$HF" ] || {
-      warn "installing the Hugging Face CLI to download the model…"
-      python3 -m pip install --quiet --user huggingface_hub || die "could not install huggingface_hub"
-      HF="$(python3 -c 'import huggingface_hub,os;print(os.path.dirname(huggingface_hub.__file__))' >/dev/null 2>&1; echo hf)"
-      command -v hf >/dev/null 2>&1 || HF="python3 -m huggingface_hub.commands.huggingface_cli"
-    }
-    warn "downloading $HF_FILE (85 GB) from $HF_REPO — this takes a while."
-    $HF download "$HF_REPO" "$HF_FILE" --local-dir "$MODELS" || die "model download failed"
+    warn "downloading $HF_FILE (85 GB) from $HF_REPO — this takes a while (resumable)."
+    # the huggingface_hub Python API, not the CLI: the CLI's module path moves
+    # between versions, this does not.
+    "$PY" - "$HF_REPO" "$HF_FILE" "$MODELS" <<'PY' || die "model download failed"
+import sys
+from huggingface_hub import hf_hub_download
+repo, fname, dest = sys.argv[1:4]
+hf_hub_download(repo_id=repo, filename=fname, local_dir=dest)
+PY
     [ -f "$MODEL" ] || die "download did not produce $MODEL"
     ok "model downloaded"
   fi
 fi
-
-# ── 4. the agent's python env ────────────────────────────────────────────────
-c "5. agent"
-if [ ! -d "$VENV" ]; then
-  python3 -m venv --system-site-packages "$VENV"
-fi
-"$VENV/bin/python" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
-"$VENV/bin/python" -m pip install --quiet prompt_toolkit || die "could not install prompt_toolkit"
-ok "agent ready"
 
 echo
 c "setup complete."

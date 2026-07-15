@@ -3,6 +3,8 @@
 Run a 295-billion-parameter model on your own Mac, with a full agent driving it.
 No API key, no cloud, nothing leaves the machine.
 
+![sesame-hy3](docs/screenshot.png)
+
 This packages two things together: [sesame](https://github.com/vcup-date/sesame-agent),
 a terminal and browser agent, and **Hy3** (Tencent HunYuan v3, 295B total / 21B
 active), running locally through a patched llama.cpp. It is set up specifically
