@@ -295,17 +295,20 @@ class Loop:
                                 summarize_fn=self._summarize,
                                 on_event=lambda ev: self._event(ev))
 
-    def _summarize(self, messages):
+    def _summarize(self, messages, should_stop=None):
         def complete(system, msgs):
+            def emit(ev):                 # the summary stream emits text deltas; ticking
+                if should_stop and should_stop():   # the stop check here lets esc cancel it
+                    raise KeyboardInterrupt()
             msg = _retrying_stream(transcript=msgs, system=system, tools=None, api=self.cfg.api,
                                    budget={"thinking_tokens": 1024, "effort": "low"},
-                                   emit=lambda e: None)
+                                   emit=emit)
             return "".join(b.get("text", "") for b in msg["content"] if b["type"] == "text")
         return compaction.compact(complete, messages, keep=self.cfg.compact_keep_recent)
 
-    def compact_now(self, ln):
+    def compact_now(self, ln, should_stop=None):
         before = self.stats.context_tokens
-        new, did = self._summarize(self.messages)
+        new, did = self._summarize(self.messages, should_stop=should_stop)
         if did:
             self.messages[:] = validate_and_repair(new)
             self.stats.context_tokens = ctx.estimate_tokens(self.messages, self.system())

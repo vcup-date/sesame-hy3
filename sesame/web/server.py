@@ -607,10 +607,25 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True, "notes": notes}
 
     def _compact(self):
+        # in the background: summarizing calls the model and can take a while, so the
+        # request returns at once and progress arrives over SSE, not a hung click.
+        AGENT._compact_hinted = False
         before = AGENT.loop.stats.context_tokens
-        did = AGENT.loop.compact_now(AGENT.ln)
-        AGENT.emit({"t": "stats", **AGENT.stats()})
-        return {"ok": bool(did), "before": before, "after": AGENT.loop.stats.context_tokens}
+        AGENT.emit({"t": "notice", "text": "compacting the conversation…"})
+
+        def work():
+            try:
+                did = AGENT.loop.compact_now(AGENT.ln)
+                after = AGENT.loop.stats.context_tokens
+                AGENT.emit({"t": "notice", "text": f"compacted · {before:,} → {after:,} tokens"
+                            if did else "nothing to compact yet"})
+            except Exception as exc:                # noqa: BLE001
+                AGENT.emit({"t": "error", "text": f"compaction failed: {exc}"})
+            finally:
+                AGENT.emit({"t": "stats", **AGENT.stats()})
+
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "running": True}
 
     def _config(self, b):
         c, action = AGENT.cfg, b.get("action")

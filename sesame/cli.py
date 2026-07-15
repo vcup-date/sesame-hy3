@@ -1262,6 +1262,30 @@ class App:
         self._redraw(full=True)          # the prompt grows: reflow
         threading.Thread(target=self._work, args=(text,), daemon=True).start()
 
+    def _background(self, label, fn, done=None):
+        """Run a slow command (compaction, summarize) off the main thread with the
+        spinner, so the prompt never freezes and esc can stop it."""
+        self.printer.blank = False
+        self.busy, self.stop = True, False
+        self.spin.begin(label)
+        self._redraw(full=True)
+
+        def work():
+            try:
+                result = fn()
+                if done:
+                    out(done(result))
+            except KeyboardInterrupt:
+                out(dim("stopped"))
+            except Exception as exc:
+                out(red(f"✖ {exc}"))
+            finally:
+                self.busy = False
+                self.spin.end()
+                self._redraw(full=True)
+
+        threading.Thread(target=work, daemon=True).start()
+
     # ── goal & loop (Codex /goal, Claude Code /loop) ─────────────────────────
     def _cmd_goal(self, arg):
         a = arg.strip()
@@ -1581,9 +1605,14 @@ class App:
                 for note in notes or []:
                     out(dim(f"  {note}"))
         elif cmd == "/compact":
-            did = self.loop.compact_now(self.printer)
             self._compact_hinted = False
-            out(dim("compacted" if did else "nothing to compact yet"))
+            out(dim("⧉ compacting the conversation… (this calls the model; it can take a bit)"))
+            # in the background so the prompt never freezes; the spinner ticks while it works
+            self._background(
+                "compacting",
+                lambda: self.loop.compact_now(self.printer),
+                lambda did: green(f"⧉ compacted — context freed to {tok(self.loop.stats.context_tokens)}")
+                if did else dim("nothing to compact yet"))
         elif cmd == "/effort":
             self._pick_effort(arg.strip().lower())
         elif cmd == "/think":
