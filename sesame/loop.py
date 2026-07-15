@@ -396,7 +396,13 @@ class Loop:
                 return {"ok": False, "content": "prompt is required"}
             secs = goals.parse_interval(str(inp.get("every") or "")) or goals.DEFAULT_LOOP_SECONDS
             self.set_loop(secs, prompt)
-            return {"ok": True, "content": f"Loop set: every {secs}s I will run: {prompt}"}
+            return {"ok": True, "content": f"Loop set: every {secs}s I will run: {prompt}. "
+                                           f"Call stop_loop to cancel it."}
+
+        def _stop_loop(inp):
+            if self.loop_clear():
+                return {"ok": True, "content": "The loop is stopped."}
+            return {"ok": True, "content": "There was no loop running."}
 
         return [
             {"name": "set_goal", "read_only": False,
@@ -418,13 +424,18 @@ class Loop:
              "execute": _goal_done},
             {"name": "set_loop", "read_only": False,
              "description": ("Re-run a prompt on an interval, e.g. every '10m'. Use for polling or "
-                             "a periodic check. It repeats until the user stops it."),
+                             "a periodic check. It repeats until stopped. To STOP a loop, call "
+                             "stop_loop — do NOT call set_loop with a prompt like 'stop'."),
              "input_schema": {"type": "object",
                               "properties": {"prompt": {"type": "string"},
                                              "every": {"type": "string",
                                                        "description": "e.g. 30s, 5m, 1h"}},
                               "required": ["prompt"]},
              "execute": _set_loop},
+            {"name": "stop_loop", "read_only": False,
+             "description": "Stop the running loop. Call this when the user asks to stop or cancel it.",
+             "input_schema": {"type": "object", "properties": {}},
+             "execute": _stop_loop},
         ]
 
     # ── session (markdown, append-only) ──────────────────────────────────────
@@ -472,6 +483,8 @@ class Loop:
         self.stats = Stats(**{k: st.get(k, 0) for k in vars(Stats()) if k in st})
         self.goal = goals.Goal.from_dict(st["goal"]) if st.get("goal") else None
         self.loop_job = goals.LoopJob.from_dict(st["loop"]) if st.get("loop") else None
+        if self.loop_job and self.loop_job.expired():   # a loop older than 7 days is not restored
+            self.loop_job = None
         self.session = tx.Session(data["name"], self.cfg.model)
         return True
 

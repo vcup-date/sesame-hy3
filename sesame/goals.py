@@ -21,6 +21,8 @@ import uuid
 
 MAX_GOAL_TURNS = 60          # a hard ceiling: a goal can never run forever
 DEFAULT_LOOP_SECONDS = 600   # /loop with no interval means every 10 minutes
+LOOP_EXPIRY_SECONDS = 7 * 24 * 3600   # a loop self-deletes 7 days after it is created,
+                                      # so a forgotten one cannot run forever
 
 
 def parse_interval(token):
@@ -92,13 +94,15 @@ class Goal:
 
 
 class LoopJob:
-    def __init__(self, interval, prompt, clock=None):
+    def __init__(self, interval, prompt, clock=None, created_at=None):
         self.interval = interval
         self.prompt = prompt.strip()
         self.id = uuid.uuid4().hex
         self.count = 0
-        # due immediately on the first check, then every `interval` seconds
-        self.next_at = (clock or time.monotonic)()
+        # created_at is wall-clock, so the 7-day expiry is right even across a
+        # resume in a new process; next_at is monotonic, for the interval itself.
+        self.created_at = created_at if created_at is not None else time.time()
+        self.next_at = (clock or time.monotonic)()   # due immediately, then every interval
 
     def due(self, now):
         return now >= self.next_at
@@ -107,13 +111,22 @@ class LoopJob:
         self.count += 1
         self.next_at = now + self.interval
 
+    def expired(self, wall_now=None):
+        now = wall_now if wall_now is not None else time.time()
+        return now >= self.created_at + LOOP_EXPIRY_SECONDS
+
+    def expires_in(self, wall_now=None):
+        now = wall_now if wall_now is not None else time.time()
+        return max(0, int(self.created_at + LOOP_EXPIRY_SECONDS - now))
+
     def to_dict(self):
         return {"interval": self.interval, "prompt": self.prompt, "count": self.count,
-                "id": self.id}
+                "id": self.id, "created_at": self.created_at}
 
     @classmethod
     def from_dict(cls, d):
-        j = cls(d.get("interval", DEFAULT_LOOP_SECONDS), d.get("prompt", ""))
+        j = cls(d.get("interval", DEFAULT_LOOP_SECONDS), d.get("prompt", ""),
+                created_at=d.get("created_at"))
         j.count = d.get("count", 0)
         j.id = d.get("id", j.id)
         return j

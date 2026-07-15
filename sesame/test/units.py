@@ -1228,8 +1228,8 @@ _lp.loop_job = None
 _lp.session = None
 _lp.stats = _loopmod.Stats()
 _gt = _lp._goal_tools()
-check("the model gets set_goal, goal_done, set_loop tools",
-      [t["name"] for t in _gt] == ["set_goal", "goal_done", "set_loop"])
+check("the model gets set_goal, goal_done, set_loop, stop_loop tools",
+      [t["name"] for t in _gt] == ["set_goal", "goal_done", "set_loop", "stop_loop"])
 _by = {t["name"]: t for t in _gt}
 check("set_goal via the tool starts a goal",
       _by["set_goal"]["execute"]({"objective": "do X"})["ok"] and _lp.goal.status == "active")
@@ -1238,6 +1238,16 @@ check("goal_done via the tool completes it",
 check("set_loop via the tool schedules it",
       _by["set_loop"]["execute"]({"prompt": "poll", "every": "1m"})["ok"]
       and _lp.loop_job.interval == 60)
+check("stop_loop via the tool cancels it (the model can stop what it started)",
+      _by["stop_loop"]["execute"]({})["ok"] and _lp.loop_job is None)
+
+# a loop self-deletes after 7 days; an expired one is not restored on resume
+import time as _time
+_old = _goals.LoopJob(300, "x", created_at=_time.time() - 8 * 86400)
+_new = _goals.LoopJob(300, "x")
+check("a loop older than 7 days is expired", _old.expired())
+check("a fresh loop is not expired, ~7 days left",
+      not _new.expired() and (_new.expires_in() + 86399) // 86400 == 7)
 
 # 11. a keyless local endpoint is a valid setup: run.sh must not force setup on it
 import config as _config                          # noqa: E402

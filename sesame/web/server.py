@@ -214,8 +214,13 @@ class Agent:
                 j = self.loop.loop_job
                 j.fired(time.monotonic())
                 self.loop._save()
-                self.emit({"t": "notice", "text": f"loop #{j.count}: {j.prompt[:60]}"})
-                self.send(j.prompt)
+                final = j.expired()              # 7 days on: last run, then delete
+                self.emit({"t": "notice", "text": f"loop #{j.count}"
+                          + (" (final — expired after 7 days)" if final else "")})
+                prompt = j.prompt
+                if final:
+                    self.loop.loop_clear()
+                self.send(prompt)
 
     def _watch_prefill(self, done):
         """A local model spends the first seconds reading your context, saying

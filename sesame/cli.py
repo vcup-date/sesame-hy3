@@ -1181,7 +1181,8 @@ class App:
         if g and g.status in ("active", "paused"):
             info += f"  ·  ⊙ goal[{g.status[:4]}] t{g.turns}"
         if self.loop.loop_job:
-            info += f"  ·  ↻ loop {self.loop.loop_job.count}×"
+            days = (self.loop.loop_job.expires_in() + 86399) // 86400
+            info += f"  ·  ↻ loop {self.loop.loop_job.count}× ({days}d left)"
         hint = "esc stop · type to steer" if self.busy else "enter send · / commands"
         return FormattedText([("class:rule", "─" * self._width() + "\n"),
                               ("class:status", f"  {info}"),
@@ -1295,7 +1296,8 @@ class App:
             if not j:
                 out(dim("no loop. /loop [interval] <prompt>, e.g. /loop 5m check the build"))
                 return
-            out(f"{bold('loop')} every {j.interval}s · ran {j.count}×")
+            days = (j.expires_in() + 86399) // 86400
+            out(f"{bold('loop')} every {j.interval}s · ran {j.count}× · expires in {days}d")
             out(dim(f"  {j.prompt}"))
             return
         if a in ("stop", "clear", "off"):
@@ -1343,8 +1345,14 @@ class App:
                 j = self.loop.loop_job
                 j.fired(time.monotonic())
                 self.loop._save()
-                out(dim(f"↻ loop #{j.count}"))
-                self._fire_loop(j.prompt)
+                if j.expired():                  # 7 days on: fire one last time, then delete
+                    out(dim(f"↻ loop #{j.count} (final — expired after 7 days)"))
+                    prompt = j.prompt
+                    self.loop.loop_clear()
+                    self._fire_loop(prompt)
+                else:
+                    out(dim(f"↻ loop #{j.count}"))
+                    self._fire_loop(j.prompt)
 
     def _run_with_steers(self, text):
         """One turn, then anything you typed while it worked, until the queue drains."""
