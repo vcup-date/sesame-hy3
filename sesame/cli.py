@@ -902,13 +902,15 @@ def paste_label(pid, text):
     return f"[paste #{pid} · {lines} lines · {preview}]"
 
 
+DIALOG_COMMANDS = {"/model", "/provider", "/resume", "/effort"}  # open a picker; not loopable
+
 COMMANDS = ["/help", "/goal", "/loop", "/model", "/provider", "/tools", "/undo", "/compact",
             "/effort", "/think", "/save", "/resume", "/sessions", "/memory", "/permissions",
             "/confirm", "/init", "/copy", "/clear", "/quit"]
 
 HELP_ROWS = [
     ("/goal <objective>", "keep working toward it until done  (pause | resume | clear)"),
-    ("/loop [5m] <prompt>", "re-run a prompt on an interval  (stop)"),
+    ("/loop <interval> <x>", "re-run a prompt or /command on an interval  (stop)"),
     ("/model", "models, saved profiles, your own endpoint: all in one picker"),
     ("/provider", "switch provider"),
     ("/tools", "what it can do"),
@@ -1298,16 +1300,30 @@ class App:
             return
         if a in ("stop", "clear", "off"):
             out(dim("loop stopped") if self.loop.loop_clear() else dim("no loop")); return
+        # format is: /loop <interval> <prompt-or-/command>. The interval is optional
+        # (defaults to 10m); the target can be a plain prompt or a slash command.
         parts = a.split(None, 1)
         secs = goals.parse_interval(parts[0])
-        if secs is not None and len(parts) > 1:
+        if secs is not None:
+            if len(parts) < 2:
+                out(dim("what should it run? /loop <interval> <prompt or /command>")); return
             prompt = parts[1]
         else:
             secs, prompt = goals.DEFAULT_LOOP_SECONDS, a
+        if prompt.startswith("/") and prompt.split()[0] in DIALOG_COMMANDS:
+            out(dim(f"{prompt.split()[0]} opens a picker and cannot be looped")); return
         self.loop.set_loop(secs, prompt)
         out(green(f"↻ loop set — every {secs}s:"))
         out(dim(f"  {prompt}"))
-        self.turn(prompt)                # run the first one now; the scheduler does the rest
+        self._fire_loop(prompt)          # run the first one now; the scheduler does the rest
+
+    def _fire_loop(self, prompt):
+        """A loop target can be a prompt (run as a turn) or a slash command like
+        /compact (run as that command), matching /loop 5m /foo."""
+        if prompt.startswith("/"):
+            self.command(prompt)
+        else:
+            self.turn(prompt)
 
     def _scheduler(self):
         """Fire a due loop job when idle. app.exit(RESTART) inside turn() re-draws the
@@ -1328,7 +1344,7 @@ class App:
                 j.fired(time.monotonic())
                 self.loop._save()
                 out(dim(f"↻ loop #{j.count}"))
-                self.turn(j.prompt)
+                self._fire_loop(j.prompt)
 
     def _run_with_steers(self, text):
         """One turn, then anything you typed while it worked, until the queue drains."""
