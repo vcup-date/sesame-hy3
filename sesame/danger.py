@@ -3,22 +3,21 @@
 This is the ONLY thing that prompts. Writing a file or making a directory is not
 dangerous — asking about it just trains you to hit "y" without reading, which is
 exactly how the prompts that matter get waved through. So the question is never
-"does this tool write?" but "is this hard to undo, or outside my project?":
+"does this tool write?" but "is this hard to undo?":
 
   destructive     rm -rf, dd, mkfs, shred, git reset --hard, git clean -f, DROP TABLE…
   irreversible    force push, publish, docker push, kubectl delete
   privileged      sudo, writes to /dev, recursive chmod/chown, moves into system dirs
   overwriting     replacing an existing non-empty file (creating one is fine)
   sensitive       .env, *.key, *.pem, id_rsa, .netrc — even when new
-  out of bounds   any write outside the working directory
   remote code     curl | sh
   persistent      a global memory write (it enters every future system prompt)
 
-Everything else — mkdir, a new file, an edit, a normal build/test command — just
-runs, and /undo can roll back any file it touched.
+Everything else — mkdir, a new file (anywhere), an edit, a normal build/test
+command — just runs, and /undo can roll back any file it touched. Location does
+not make a write dangerous; destroying existing content does.
 """
 
-import os
 import re
 from pathlib import Path
 
@@ -130,16 +129,6 @@ def _sensitive(p):
             or name in ("id_rsa", "id_ed25519", "credentials", ".netrc", ".npmrc"))
 
 
-def _outside_project(p):
-    """A write outside the working directory is a different kind of act — it is
-    touching something you did not open the agent on."""
-    try:
-        root = Path(os.environ.get("SESAME_WORKDIR") or os.getcwd()).resolve()
-        return root not in p.resolve().parents and p.resolve() != root
-    except OSError:
-        return True
-
-
 def check(name, args):
     if name == "bash":
         return check_bash(str(args.get("command", "")))
@@ -147,13 +136,15 @@ def check(name, args):
         p = Path(str(args.get("path", ""))).expanduser()
         if _sensitive(p):
             return f"modifies a sensitive file ({p.name})"
-        if _outside_project(p):
-            return f"writes outside the working directory ({p})"
+        # Creating a new file is not a dangerous act, wherever it lives: nothing is
+        # destroyed and /undo deletes it again. Only REPLACING an existing file's
+        # contents is worth a prompt — and a write overwrites the whole file,
+        # while an edit is a surgical, undoable change. So: overwrite prompts,
+        # create and edit do not. (Location does not decide this; destruction does.)
         if name == "write" and p.is_file() and p.stat().st_size > 0:
             if p.suffix.lower() in (".db", ".sqlite", ".sqlite3"):
                 return "overwrites a database file"
             return f"overwrites existing file {p.name}"
-        # a NEW file, or an edit inside the project: not dangerous — /undo covers it
     if name == "remember" and args.get("scope", "global") != "session":
         return "adds a permanent item to every future system prompt"
     if name == "forget" and args.get("scope", "global") != "session":

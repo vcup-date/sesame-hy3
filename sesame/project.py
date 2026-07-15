@@ -203,9 +203,13 @@ def prefix_allowed(perms, name, args):
     that exact command, not the tool in general.
     """
     primary = str((args or {}).get("command") or (args or {}).get("path") or "")
+    # write and edit are one permission group: approving "always" for a write to a
+    # folder should cover editing files there too, and the reverse. Otherwise you
+    # approve the write, then get asked again the moment it edits the same file.
+    group = {"write", "edit"} if name in ("write", "edit") else {name}
     for rule in perms["prefixes"]:
         tool, _, prefix = rule.partition(":")
-        if tool == name and prefix and primary.startswith(prefix):
+        if tool in group and prefix and primary.startswith(prefix):
             return True
     return False
 
