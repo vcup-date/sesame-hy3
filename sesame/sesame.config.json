@@ -1,0 +1,12 @@
+{
+  "baseUrl": "https://api.deepseek.com/anthropic",
+  "model": "deepseek-v4-flash",
+  "maxTokens": 8192,
+  "toolCallBudget": 50,
+  "thinkingTokens": 4096,
+  "bashTimeoutMs": 180000,
+  "toolOutputLimit": 16000,
+  "confirmDanger": true,
+  "showThinking": false,
+  "compactKeepRecent": 8
+}

@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sesame agent</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='11' fill='%23d9a441'/></svg>">
+</head>
+<body>
+
+<aside id="rail">
+  <div class="rail-top">
+    <div class="brand"><span class="seed"></span> sesame agent</div>
+    <button id="newChat" class="btn ghost" title="New chat">New</button>
+  </div>
+
+  <div class="rail-label">Sessions</div>
+  <input id="sessionSearch" class="search" placeholder="Search sessions" autocomplete="off">
+  <div id="sessions" class="sessions"></div>
+
+  <div class="rail-foot">
+    <button id="openSettings" class="model-chip">
+      <span class="model-name" id="railModel">…</span>
+      <span class="model-sub" id="railProvider"></span>
+    </button>
+    <div class="folder" id="railFolder" title=""></div>
+  </div>
+</aside>
+
+<main>
+  <header id="topbar">
+    <div class="title" id="title">New chat</div>
+    <div class="meters">
+      <button class="now" id="nowChip" title="Model and profile. Click to change.">
+        <span class="now-profile hidden" id="nowProfile"></span>
+        <span class="now-model" id="nowModel">…</span>
+        <span class="now-where" id="nowWhere"></span>
+      </button>
+      <div class="meter" title="context used">
+        <div class="meter-bar"><span id="ctxFill"></span></div>
+        <span class="meter-text" id="ctxText">0</span>
+      </div>
+      <div class="stat" id="costText">$0</div>
+      <button class="icon" id="themeBtn" title="Theme">◐</button>
+      <button class="icon" id="gearBtn" title="Settings">⚙</button>
+    </div>
+  </header>
+
+  <div id="offline" class="offline hidden">connection lost, reconnecting…</div>
+
+  <div id="scroll">
+    <div id="thread"></div>
+    <div id="empty" class="empty">
+      <div class="empty-seed"></div>
+      <h1>What are we doing?</h1>
+      <p>It reads and edits files, runs commands, searches the web, and drives a browser.</p>
+      <div class="chips">
+        <button class="chip" data-q="What is in this folder, and what does it do?">Explain this folder</button>
+        <button class="chip" data-q="Find the top 3 stories on Hacker News and summarize each in one line.">Read the web</button>
+        <button class="chip" data-q="Run the tests and fix whatever fails.">Run the tests</button>
+      </div>
+    </div>
+  </div>
+
+  <button id="toBottom" class="to-bottom hidden">↓ latest</button>
+
+  <div id="composer">
+    <div id="statusline" class="statusline hidden">
+      <span class="dot"></span>
+      <span id="statusText"></span>
+      <span id="prefill" class="prefill hidden"></span>
+      <span id="rate" class="rate"></span>
+    </div>
+    <div class="input-wrap">
+      <textarea id="input" rows="1" placeholder="Ask it to do something. Enter to send, shift enter for a new line."></textarea>
+      <button id="send" class="btn primary" title="Send">Send</button>
+      <button id="stop" class="btn danger hidden" title="Stop">Stop</button>
+    </div>
+    <div class="composer-foot">
+      <span id="hint">enter send · shift enter newline</span>
+      <span class="foot-right">
+        <button class="link" id="undoBtn">Undo last turn</button>
+        <button class="link" id="compactBtn">Compact context</button>
+      </span>
+    </div>
+  </div>
+</main>
+
+<!-- settings -->
+<div id="modal" class="modal hidden">
+  <div class="sheet">
+    <div class="sheet-head">
+      <h2>Settings</h2>
+      <button class="icon" id="closeSettings">✕</button>
+    </div>
+    <div class="sheet-body">
+      <nav class="tabs">
+        <button class="tab on" data-tab="model">Model</button>
+        <button class="tab" data-tab="profiles">Profiles</button>
+        <button class="tab" data-tab="behavior">Behavior</button>
+        <button class="tab" data-tab="permissions">Permissions</button>
+        <button class="tab" data-tab="workspace">Workspace</button>
+        <button class="tab" data-tab="appearance">Appearance</button>
+      </nav>
+
+      <section class="pane on" id="pane-model">
+        <div class="row">
+          <div>
+            <div class="row-title">Provider</div>
+            <div class="row-sub">Where the model runs. Local endpoints need no key.</div>
+          </div>
+          <select id="providerSel"></select>
+        </div>
+
+        <div class="row">
+          <div>
+            <div class="row-title">API key</div>
+            <div class="row-sub" id="keyState">not set</div>
+          </div>
+          <div class="inline">
+            <input id="keyInput" type="password" placeholder="sk-…" autocomplete="off">
+            <button class="btn" id="keySave">Save</button>
+          </div>
+        </div>
+
+        <div class="row col">
+          <div class="row-head">
+            <div>
+              <div class="row-title">Model</div>
+              <div class="row-sub" id="modelSource">from your provider</div>
+            </div>
+            <button class="btn ghost" id="refreshModels">Refresh</button>
+          </div>
+          <div id="modelList" class="list"></div>
+        </div>
+
+        <div class="row col">
+          <div class="row-head">
+            <div>
+              <div class="row-title">Your own endpoint</div>
+              <div class="row-sub">Ollama, LM Studio, llama.cpp, vLLM, or any compatible URL.</div>
+            </div>
+          </div>
+          <div class="grid2">
+            <label>Base URL<input id="cxUrl" placeholder="http://127.0.0.1:11434/v1"></label>
+            <label>Model id<input id="cxModel" placeholder="qwen3-coder"></label>
+            <label>Protocol
+              <select id="cxWire">
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+              </select>
+            </label>
+            <label>API key (blank if local)<input id="cxKey" type="password" placeholder=""></label>
+            <label>Context window
+              <span class="inline">
+                <input id="cxWindow" placeholder="ask the server">
+                <button class="btn ghost" id="cxDetect">Detect</button>
+              </span>
+            </label>
+          </div>
+          <div class="row-actions">
+            <span class="row-sub" id="cxStatus"></span>
+            <button class="btn primary" id="cxConnect">Connect</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="pane" id="pane-profiles">
+        <div class="row col">
+          <div class="row-head">
+            <div>
+              <div class="row-title">Saved setups</div>
+              <div class="row-sub">Endpoint, protocol, model, key, context window and effort, under one name.</div>
+            </div>
+          </div>
+          <div id="profileList" class="list"></div>
+        </div>
+        <div class="row">
+          <div>
+            <div class="row-title">Save the current setup</div>
+            <div class="row-sub" id="profileNow"></div>
+          </div>
+          <div class="inline">
+            <input id="profileName" placeholder="work, local, research…">
+            <button class="btn primary" id="profileSave">Save</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="pane" id="pane-behavior">
+        <div class="row col">
+          <div class="row-head">
+            <div>
+              <div class="row-title">Effort</div>
+              <div class="row-sub" id="effortSub">How long it is allowed to think before answering.</div>
+            </div>
+          </div>
+          <div class="effort">
+            <input type="range" id="effort" min="0" max="3" step="1">
+            <div class="ticks"><span>low</span><span>medium</span><span>high</span><span>max</span></div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <div class="row-title">Ask before dangerous actions</div>
+            <div class="row-sub">rm -rf, sudo, force push, overwriting a file, writing outside the folder.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="confirmDanger"><span></span></label>
+        </div>
+
+        <div class="row">
+          <div>
+            <div class="row-title">Ask before every write</div>
+            <div class="row-sub">Noisy. Off by default, and undo covers ordinary edits.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="confirmAll"><span></span></label>
+        </div>
+
+        <div class="row">
+          <div>
+            <div class="row-title">Tool calls per turn</div>
+            <div class="row-sub">A ceiling, so a loop cannot run away with your money.</div>
+          </div>
+          <input class="num" id="toolBudget" type="number" min="1" max="200">
+        </div>
+
+        <div class="row">
+          <div>
+            <div class="row-title">Max output tokens</div>
+            <div class="row-sub">Per reply.</div>
+          </div>
+          <input class="num" id="maxTokens" type="number" min="1024" step="1024">
+        </div>
+
+        <div class="row">
+          <div>
+            <div class="row-title">Temperature</div>
+            <div class="row-sub">Blank uses the model's own default.</div>
+          </div>
+          <input class="num" id="temperature" type="text" placeholder="default">
+        </div>
+
+        <div class="row">
+          <div>
+            <div class="row-title">Show the browser window</div>
+            <div class="row-sub">Watch Chromium work instead of running it headless.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="browserHeaded"><span></span></label>
+        </div>
+      </section>
+
+      <section class="pane" id="pane-permissions">
+        <div class="row col">
+          <div class="row-head">
+            <div>
+              <div class="row-title">Allowed without asking</div>
+              <div class="row-sub">What you approved with "always" in this folder.</div>
+            </div>
+            <button class="btn ghost" id="permReset">Reset all</button>
+          </div>
+          <div id="permList" class="list"></div>
+        </div>
+      </section>
+
+      <section class="pane" id="pane-appearance">
+        <div class="row">
+          <div>
+            <div class="row-title">Theme</div>
+            <div class="row-sub">Dark, light, or whatever your system is set to.</div>
+          </div>
+          <div class="seg">
+            <button data-theme-set="dark">Dark</button>
+            <button data-theme-set="light">Light</button>
+            <button data-theme-set="system">System</button>
+          </div>
+        </div>
+
+        <div class="row col">
+          <div class="row-head">
+            <div>
+              <div class="row-title">Text size</div>
+              <div class="row-sub" id="uiSizeSub">Scales the whole interface, not just the text.</div>
+            </div>
+            <button class="btn ghost" id="uiSizeReset">Reset</button>
+          </div>
+          <div class="effort">
+            <input type="range" id="uiSize" min="85" max="130" step="5">
+            <div class="ticks"><span>small</span><span>default</span><span>large</span></div>
+          </div>
+          <div class="size-preview" id="sizePreview">
+            The quick brown fox jumps over the lazy dog. <code>total * rate</code>
+          </div>
+        </div>
+      </section>
+
+      <section class="pane" id="pane-workspace">
+        <div class="row">
+          <div>
+            <div class="row-title">Working folder</div>
+            <div class="row-sub" id="wdSub"></div>
+          </div>
+          <div class="inline">
+            <input id="wdInput" placeholder="/path/to/project">
+            <button class="btn" id="wdSave">Change</button>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <div class="row-title">Project instructions</div>
+            <div class="row-sub" id="wdFiles">none found</div>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <div class="row-title">Git</div>
+            <div class="row-sub" id="wdGit">not a repository</div>
+          </div>
+        </div>
+        <div class="row col">
+          <div class="row-head">
+            <div>
+              <div class="row-title">Undo</div>
+              <div class="row-sub">Every file is snapshotted before it is touched.</div>
+            </div>
+          </div>
+          <div id="undoList" class="list"></div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

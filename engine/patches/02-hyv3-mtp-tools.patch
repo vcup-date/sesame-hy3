@@ -1,0 +1,581 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 02-hyv3-mtp-tools.patch — HY_V3 second-stage: MTP + thinking/tool parser
+#
+# Base        : 19bba67c1 WITH 01-hyv3-arch.patch already applied.
+#               (This patch depends on 01; apply 01 first, then this one.)
+#
+# PROVENANCE / ATTRIBUTION
+#   Original work, not derived from the GrahLnn patch.
+#
+# WHAT IT ADDS (two independent features)
+#   1. MTP / NextN self-speculative decoding for hy_v3
+#      - loads the extra decoder block (HF model.layers.<n_hidden>, e.g. layer 80)
+#        as a NextN head; adds graph_mtp mirroring vLLM HYV3MultiTokenPredictorLayer.
+#      - gated purely by hparams.n_layer_nextn: pre-MTP gguf (key absent) load & run
+#        BYTE-FOR-BYTE unchanged. Enable at runtime with: --spec-type draft-mtp
+#      - conversion: emit nextn_predict_layers; convert_hf_to_gguf.py --no-mtp drops
+#        the head (for checkpoints that carry no MTP weights).
+#   2. hy_v3 thinking + tool-call parser (common/chat.cpp)
+#      - <think{sfx}>...</think{sfx}> reasoning + key/value-split tagged tool calls
+#        (<tool_call{sfx}>name<tool_sep{sfx}><arg_key..><arg_value..>). PEG-native.
+#      - per-tokenizer special-token suffix (e.g. ":opensource" or empty) is
+#        EXTRACTED from the chat template at runtime, never hard-coded.
+#
+# APPLY (after 01)
+#   git apply 02-hyv3-mtp-tools.patch
+# ─────────────────────────────────────────────────────────────────────────────
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 24e58ab06..56569383d 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -22,6 +22,7 @@
+ #include <functional>
+ 
+ #include <optional>
++#include <regex>
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
+@@ -1608,6 +1609,178 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
+     return data;
+ }
+ 
++// Hunyuan V3 (hy_v3) parser.
++// Reasoning: <think{sfx}>{reasoning}</think{sfx}>
++// Tool calls (constructed / tagged, key-value split):
++//   <tool_calls{sfx}>
++//   <tool_call{sfx}>{func-name}<tool_sep{sfx}>
++//   <arg_key{sfx}>{key}</arg_key{sfx}>
++//   <arg_value{sfx}>{value}</arg_value{sfx}>
++//   ...
++//   </tool_call{sfx}>
++//   </tool_calls{sfx}>
++// The special tokens carry a per-tokenizer suffix (e.g. ":opensource" or empty),
++// so we extract the concrete literals from the template source rather than
++// hard-coding them.
++static common_chat_params common_chat_params_init_hunyuan_v3(const common_chat_template &          tmpl,
++                                                             const autoparser::generation_params & inputs) {
++    common_chat_params data;
++
++    const std::string & src = tmpl.source();
++
++    // Pull the concrete token literal assigned to a jinja variable, e.g.
++    //   {%- set toolsep_token = '<tool_sep:opensource>' %}
++    auto extract_tok = [&src](const std::string & var, const std::string & fallback) -> std::string {
++        std::smatch m;
++        std::regex  re(var + R"(\s*=\s*'([^']*)')");
++        if (std::regex_search(src, m, re)) {
++            return m[1].str();
++        }
++        return fallback;
++    };
++
++    const std::string think_begin    = extract_tok("think_begin_token",       "<think>");
++    const std::string think_end      = extract_tok("think_end_token",         "</think>");
++    const std::string tcalls_begin   = extract_tok("toolcalls_begin_token",   "<tool_calls>");
++    const std::string tcalls_end     = extract_tok("toolcalls_end_token",     "</tool_calls>");
++    const std::string tcall_begin    = extract_tok("toolcall_begin_token",    "<tool_call>");
++    const std::string tcall_end      = extract_tok("toolcall_end_token",      "</tool_call>");
++    const std::string tsep           = extract_tok("toolsep_token",           "<tool_sep>");
++    const std::string argkey_begin   = extract_tok("argkey_begin_token",      "<arg_key>");
++    const std::string argkey_end     = extract_tok("argkey_end_token",        "</arg_key>");
++    const std::string argval_begin   = extract_tok("argvalue_begin_token",    "<arg_value>");
++    const std::string argval_end     = extract_tok("argvalue_end_token",      "</arg_value>");
++    const std::string assistant_tok  = extract_tok("assistant_token",         "");
++
++    auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
++    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
++    auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
++
++    data.supports_thinking  = true;
++    data.thinking_start_tag = think_begin;
++    data.thinking_end_tag   = think_end;
++    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs);
++    data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs);
++    data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
++    data.preserved_tokens   = {
++        think_begin, think_end,
++        tcalls_begin, tcalls_end,
++        tcall_begin, tcall_end, tsep,
++        argkey_begin, argkey_end,
++        argval_begin, argval_end,
++    };
++
++    if (inputs.has_continuation()) {
++        const auto & msg = inputs.continue_msg;
++
++        data.generation_prompt = think_begin + msg.reasoning_content;
++        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
++            data.generation_prompt += think_end + msg.render_content();
++        }
++
++        data.prompt += data.generation_prompt;
++    }
++
++    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
++        // The generation prompt prefix that precedes the model's real output may
++        // still be present in the decoded text, in one of these shapes:
++        //   {assistant}                        (default)
++        //   {assistant}{think_begin}           (reasoning_effort low/high)
++        //   {assistant}{think_begin}{think_end}(reasoning_effort no_think)
++        // Consume an optional leading assistant token so it never leaks into content.
++        auto gen_prefix = assistant_tok.empty() ? p.eps() : p.optional(p.literal(assistant_tok));
++
++        // Reasoning block is optional: <think{sfx}>...</think{sfx}>
++        auto reasoning = extract_reasoning
++            ? p.optional(p.literal(think_begin) +
++                         p.reasoning(p.until(think_end)) +
++                         p.literal(think_end))
++            : p.eps();
++
++        // Content only (no tools)
++        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
++            include_grammar = false;
++            return gen_prefix + (reasoning << p.content(p.rest()));
++        }
++
++        // One tool call: <tool_call{sfx}>NAME<tool_sep{sfx}> {args} </tool_call{sfx}>
++        // where {args} is a sequence of
++        //   <arg_key{sfx}>KEY</arg_key{sfx}> <arg_value{sfx}>VALUE</arg_value{sfx}>
++        auto tool_choice = p.choice();
++        foreach_function(inputs.tools, [&](const json & tool) {
++            const auto & function = tool.at("function");
++            std::string  name     = function.at("name");
++            const json & params   = function.contains("parameters") ? function.at("parameters") : json::object();
++
++            // Build per-argument parsers restricted to schema-declared property names.
++            auto args = p.eps();
++            if (params.contains("properties") && !params.at("properties").empty()) {
++                auto arg_choice = p.choice();
++                for (const auto & el : params.at("properties").items()) {
++                    const std::string & prop = el.key();
++                    // Values for string-typed params are literal text (must be quoted in
++                    // the emitted JSON); other types are parsed as JSON/python scalars.
++                    std::string ptype;
++                    if (el.value().is_object() && el.value().contains("type") &&
++                        el.value().at("type").is_string()) {
++                        ptype = el.value().at("type").get<std::string>();
++                    }
++                    auto value_node = (ptype == "string")
++                        ? p.tool_arg_string_value(p.until(argval_end))
++                        : p.tool_arg_value(p.until(argval_end));
++                    arg_choice |= p.tool_arg(
++                        p.tool_arg_open(p.literal(argkey_begin)) +
++                        p.tool_arg_name(p.literal(prop)) +
++                        p.literal(argkey_end) + p.space() +
++                        p.literal(argval_begin) +
++                        value_node +
++                        p.tool_arg_close(p.literal(argval_end)));
++                }
++                args = p.zero_or_more(arg_choice + p.space());
++            }
++
++            auto tool_parser = p.tool(
++                p.tool_open(p.literal(tcall_begin) + p.tool_name(p.literal(name)) + p.literal(tsep)) +
++                p.space() + p.tool_args(args) + p.space() +
++                p.tool_close(p.literal(tcall_end)));
++
++            tool_choice |= p.rule("tool-" + name, tool_parser);
++        });
++
++        auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
++        auto min_calls  = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
++        // Section: <tool_calls{sfx}> (one or more tool calls) </tool_calls{sfx}>
++        auto tool_calls = p.trigger_rule("tool-call",
++            p.literal(tcalls_begin) + p.space() +
++            p.repeat(tool_choice + p.space(), min_calls, max_calls) +
++            p.optional(p.literal(tcalls_end)));
++
++        auto content_before_tools = p.content(p.until(tcalls_begin));
++
++        return gen_prefix + (reasoning << content_before_tools << tool_calls);
++    });
++
++    data.parser = parser.save();
++
++    if (include_grammar) {
++        data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
++        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
++            foreach_function(inputs.tools, [&](const json & tool) {
++                const auto & function = tool.at("function");
++                auto         schema   = function.at("parameters");
++                builder.resolve_refs(schema);
++            });
++            parser.build_grammar(builder, data.grammar_lazy);
++        });
++
++        data.grammar_triggers = {
++            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, tcalls_begin }
++        };
++    }
++
++    return data;
++}
++
+ // LFM2/LFM2.5 parser. Tool calls are almost Python-style and parallel-capable
+ // (except dotted names and JSON literals true/false/null).
+ // Always wrapped in <|tool_call_start|>[name(args)]<|tool_call_end|> with optional <think> reasoning.
+@@ -2197,6 +2370,16 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
+         return common_chat_params_init_ministral_3(tmpl, params);
+     }
+ 
++    // Hunyuan V3 (hy_v3) - key/value split tagged tool calls with per-tokenizer
++    // suffixed special tokens. Detection: template defines the hy_v3-specific
++    // arg_key/arg_value and tool_sep jinja variables (suffix-independent).
++    if (src.find("argkey_begin_token") != std::string::npos &&
++        src.find("argvalue_begin_token") != std::string::npos &&
++        src.find("toolsep_token") != std::string::npos) {
++        LOG_DBG("Using specialized template: Hunyuan V3\n");
++        return common_chat_params_init_hunyuan_v3(tmpl, params);
++    }
++
+     // GPT-OSS - has unique channel-based structure that needs dedicated handler
+     if (src.find("<|channel|>") != std::string::npos) {
+         LOG_DBG("Using specialized template: GPT-OSS\n");
+diff --git a/conversion/hyv3.py b/conversion/hyv3.py
+index b8cb117ac..aa1dfdb59 100644
+--- a/conversion/hyv3.py
++++ b/conversion/hyv3.py
+@@ -14,6 +14,24 @@ from .base import ModelBase, TextModel, gguf, logger
+ class HYV3Model(TextModel):
+     model_arch = gguf.MODEL_ARCH.HYV3
+ 
++    # Exclude the multi-token prediction (MTP / nextn) block from the converted
++    # GGUF. Set via convert_hf_to_gguf.py --no-mtp for compatibility with the
++    # pre-MTP conversion path (matches _Qwen35MtpMixin.no_mtp).
++    no_mtp: bool = False
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # The HF HYV3 checkpoint carries the MTP head as the extra decoder block
++        # model.layers.<num_hidden_layers> (e.g. layer 80). The base class sets
++        # block_count = num_hidden_layers, which drops it. Extend block_count so
++        # the standard layer-indexed tensor_map picks the MTP block up, then let
++        # set_gguf_parameters emit nextn_predict_layers so the engine subtracts
++        # it back out (n_layer = n_layer_all - n_layer_nextn).
++        self._nextn_layers = 0 if self.no_mtp else int(self.hparams.get("num_nextn_predict_layers", 0))
++        if self._nextn_layers > 0:
++            self.block_count += self._nextn_layers
++            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
++
+     def set_vocab(self):
+         self._set_vocab_gpt2()
+ 
+@@ -29,6 +47,9 @@ class HYV3Model(TextModel):
+         self.gguf_writer.add_expert_weights_scale(float(self.hparams.get("router_scaling_factor", 1.0)))
+         self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+         logger.info("gguf: HYV3 sigmoid router with correction bias")
++        if self._nextn_layers > 0:
++            self.gguf_writer.add_nextn_predict_layers(self._nextn_layers)
++            logger.info("gguf: HYV3 MTP head enabled (nextn_predict_layers=%d)", self._nextn_layers)
+ 
+     _experts: list[dict[str, Tensor]] | None = None
+ 
+diff --git a/gguf-py/gguf/__init__.py b/gguf-py/gguf/__init__.py
+index 243defc4c..a39401789 100644
+--- a/gguf-py/gguf/__init__.py
++++ b/gguf-py/gguf/__init__.py
+@@ -7,3 +7,5 @@ from .tensor_mapping import *
+ from .vocab import *
+ from .utility import *
+ from .metadata import *
++
++__version__ = "0.19.0"
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 5cc64e4d2..099e6bb0c 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -3781,6 +3781,12 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.FFN_GATE_SHEXP,
+         MODEL_TENSOR.FFN_DOWN_SHEXP,
+         MODEL_TENSOR.FFN_UP_SHEXP,
++        MODEL_TENSOR.NEXTN_EH_PROJ,
++        MODEL_TENSOR.NEXTN_EMBED_TOKENS,
++        MODEL_TENSOR.NEXTN_ENORM,
++        MODEL_TENSOR.NEXTN_HNORM,
++        MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
++        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+     ],
+     MODEL_ARCH.HUNYUAN_DENSE: [
+         MODEL_TENSOR.TOKEN_EMBD,
+diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
+index a9537983d..99cf5158a 100644
+--- a/gguf-py/gguf/tensor_mapping.py
++++ b/gguf-py/gguf/tensor_mapping.py
+@@ -2397,6 +2397,7 @@ class TensorNameMap:
+ 
+         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
+             "model.layers.{bid}.shared_head.norm",
++            "model.layers.{bid}.final_layernorm",       # hy_v3 MTP
+         ),
+     }
+ 
+diff --git a/src/models/hyv3.cpp b/src/models/hyv3.cpp
+index 26a200814..ea9172df2 100644
+--- a/src/models/hyv3.cpp
++++ b/src/models/hyv3.cpp
+@@ -8,6 +8,10 @@ void llama_model_hyv3::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
+     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm, false);
+ 
++    // MTP / NextN head (optional). Absent in pre-MTP gguf -> n_layer_nextn stays 0
++    // and everything below (extra block load, MTP graph, MTP context) is skipped.
++    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,              hparams.n_layer_nextn, false);
++
+     if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
+         hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
+     }
+@@ -57,9 +61,51 @@ void llama_model_hyv3::load_arch_tensors(llama_model_loader &) {
+         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp}, TENSOR_NOT_REQUIRED);
+         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, TENSOR_NOT_REQUIRED);
+     }
++
++    // MTP / NextN block(s): loaded as extra decoder blocks beyond the main stack
++    // (index range [n_layer, n_layer_all)). Skipped entirely for pre-MTP gguf
++    // where n_layer_all == n_layer, so those models load unchanged.
++    for (int i = n_layer; i < (int) hparams.n_layer_all; ++i) {
++        auto & layer = layers[i];
++        const int64_t n_ff_exp   = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
++        const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff_exp;
++
++        // Standard hy_v3 MoE decoder block (same layout as a trunk sparse layer).
++        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
++
++        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, 0);
++        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
++
++        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
++        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
++
++        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
++
++        layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
++        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
++        layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,   "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
++        create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
++
++        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_shexp}, TENSOR_NOT_REQUIRED);
++        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp}, TENSOR_NOT_REQUIRED);
++        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, TENSOR_NOT_REQUIRED);
++
++        // NextN-specific tensors. eh_proj fuses [enorm(embed), hnorm(hidden)] (2*n_embd -> n_embd).
++        // shared_head_head / embed_tokens are tied to the main lm_head / tok_embd in Hy3,
++        // so they are optional and fall back in the graph.
++        layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2 * n_embd, n_embd}, 0);
++        layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd},              0);
++        layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd},              0);
++        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd},              TENSOR_NOT_REQUIRED);
++        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab},     TENSOR_NOT_REQUIRED);
++        layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), {n_embd, n_vocab},     TENSOR_NOT_REQUIRED);
++    }
+ }
+ 
+ std::unique_ptr<llm_graph_context> llama_model_hyv3::build_arch_graph(const llm_graph_params & params) const {
++    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
++        return std::make_unique<graph_mtp>(*this, params);
++    }
+     return std::make_unique<graph>(*this, params);
+ }
+ 
+@@ -106,7 +152,7 @@ llama_model_hyv3::graph::graph(const llama_model & model, const llm_graph_params
+             cb(cur, "attn_out", il);
+         }
+ 
+-        if (il == n_layer - 1 && inp_out_ids) {
++        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+@@ -164,6 +210,17 @@ llama_model_hyv3::graph::graph(const llama_model & model, const llm_graph_params
+     }
+ 
+     cur = build_norm(inpL, model.output_norm, nullptr, LLM_NORM_RMS, -1);
++
++    // post-norm hidden state feeds both the LM head and the MTP seed (t_h_nextn).
++    // When masking is off, the MTP path needs the full-width hidden, so defer the
++    // output-id gather until after capturing t_h_nextn (matches qwen35moe).
++    cb(cur, "h_nextn", -1);
++    res->t_h_nextn = cur;
++
++    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    }
++
+     cb(cur, "result_norm", -1);
+     res->t_embd = cur;
+ 
+@@ -173,3 +230,159 @@ llama_model_hyv3::graph::graph(const llama_model & model, const llm_graph_params
+ 
+     ggml_build_forward_expand(gf, cur);
+ }
++
++// LLM_GRAPH_TYPE_DECODER_MTP draft head for Hy3 MoE.
++// Mirrors vLLM HYV3MultiTokenPredictorLayer.forward:
++//   e = enorm(inputs_embeds); h = hnorm(previous_hidden);
++//   x = eh_proj(cat([e, h]));  x = mtp_block(x);  x += residual;  x = final_ln(x)
++//   logits = lm_head(x)      (lm_head/embed tied to the main model)
++// Differences vs qwen35moe MTP: default RoPE (not mrope), no attention gate,
++// no shared-expert gate, sigmoid MoE gating with correction bias.
++llama_model_hyv3::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
++    : llm_graph_context(params) {
++    const int64_t n_embd_head = hparams.n_embd_head_v();
++    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
++    GGML_ASSERT(n_embd_head == n_rot);
++
++    GGML_ASSERT(hparams.n_layer_nextn > 0 && "HYV3 MTP requires n_layer_nextn > 0");
++    GGML_ASSERT(hparams.n_layer_nextn == 1 && "HYV3 MTP currently only supports a single MTP block");
++
++    const int il = hparams.n_layer();
++    const auto & layer = model.layers[il];
++
++    GGML_ASSERT(layer.nextn.eh_proj && "HYV3 MTP block missing nextn.eh_proj");
++    GGML_ASSERT(layer.nextn.enorm   && "HYV3 MTP block missing nextn.enorm");
++    GGML_ASSERT(layer.nextn.hnorm   && "HYV3 MTP block missing nextn.hnorm");
++    GGML_ASSERT(layer.ffn_gate_inp  && "HYV3 MTP block missing ffn_gate_inp");
++
++    const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
++
++    // Inputs: token ids (-> embedding), and the previous-step hidden state h.
++    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
++
++    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++    ggml_set_input(inp->tokens);
++
++    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
++    ggml_set_input(inp->embd);
++
++    ggml_tensor * tok_embd;
++    if (ubatch.token) {
++        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
++        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
++    } else {
++        tok_embd = inp->embd;
++    }
++    cb(tok_embd, "mtp_tok_embd", il);
++
++    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
++    ggml_set_input(inp->h);
++    ggml_set_name(inp->h, "mtp_h_input");
++
++    ggml_tensor * h_embd = inp->h;
++
++    res->add_input(std::move(inp));
++
++    ggml_tensor * inp_pos     = build_inp_pos();
++    ggml_tensor * inp_out_ids = build_inp_out_ids();
++
++    auto * inp_attn = build_attn_inp_kv();
++
++    // e = enorm(embed), h = hnorm(hidden); fuse via eh_proj: cat([e, h]) -> n_embd
++    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
++    cb(e_norm, "mtp_enorm", il);
++
++    ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
++    cb(h_norm, "mtp_hnorm", il);
++
++    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
++    cb(concat, "mtp_concat", il);
++
++    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
++    cb(cur, "mtp_eh_proj", il);
++
++    // --- one standard hy_v3 decoder block on the fused hidden ---
++    ggml_tensor * inpSA = cur;
++
++    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
++    cb(cur, "mtp_attn_norm", il);
++
++    {
++        ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
++
++        auto [Qcur, Kcur, Vcur] = build_qkv(layer, cur, n_embd_head, n_head, n_head_kv, il);
++
++        Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
++        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
++
++        Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, rope_factors,
++                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                ext_factor, attn_factor, beta_fast, beta_slow);
++        Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, rope_factors,
++                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                ext_factor, attn_factor, beta_fast, beta_slow);
++
++        cur = build_attn(inp_attn,
++                layer.wo, layer.wo_b, layer.wo_s,
++                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
++        cb(cur, "mtp_attn_out", il);
++    }
++
++    ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
++    cb(ffn_inp, "mtp_ffn_inp", il);
++
++    cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
++    cb(cur, "mtp_ffn_norm", il);
++
++    ggml_tensor * moe_out = build_moe_ffn(cur,
++            layer.ffn_gate_inp,
++            layer.ffn_up_exps,
++            layer.ffn_gate_exps,
++            layer.ffn_down_exps,
++            layer.ffn_exp_probs_b,
++            n_expert, n_expert_used,
++            LLM_FFN_SILU,
++            hparams.expert_weights_norm,
++            hparams.expert_weights_scale,
++            (llama_expert_gating_func_type) hparams.expert_gating_func,
++            il,
++            nullptr, layer.ffn_gate_up_exps,
++            layer.ffn_up_exps_s,
++            layer.ffn_gate_exps_s,
++            layer.ffn_down_exps_s);
++    cb(moe_out, "mtp_ffn_moe_out", il);
++
++    ggml_tensor * sh_out = build_ffn(cur,
++            layer.ffn_up_shexp,   nullptr, layer.ffn_up_shexp_s,
++            layer.ffn_gate_shexp, nullptr, layer.ffn_gate_shexp_s,
++            layer.ffn_down_shexp, nullptr, layer.ffn_down_shexp_s,
++            nullptr,
++            LLM_FFN_SILU, LLM_FFN_PAR, il);
++    cb(sh_out, "mtp_ffn_shared_out", il);
++
++    cur = ggml_add(ctx0, moe_out, sh_out);
++    cb(cur, "mtp_ffn_out", il);
++
++    cur = ggml_add(ctx0, cur, ffn_inp);
++    cb(cur, "mtp_post_ffn", il);
++
++    // final_layernorm then LM head (both fall back to the main model when tied)
++    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
++    GGML_ASSERT(head_norm_w && "HYV3 MTP: missing both nextn.shared_head_norm and output_norm");
++    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
++
++    cb(cur, "h_nextn", -1);
++    res->t_h_nextn = cur;
++
++    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    cb(cur, "mtp_final_norm", -1);
++
++    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
++    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
++    GGML_ASSERT(head_w && "HYV3 MTP: missing LM head (nextn.shared_head_head or model.output)");
++    cur = build_lora_mm(head_w, cur, head_s);
++    cb(cur, "result_output", -1);
++
++    res->t_logits = cur;
++    ggml_build_forward_expand(gf, cur);
++}
+diff --git a/src/models/models.h b/src/models/models.h
+index c75289d34..641fdf9e9 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1575,6 +1575,10 @@ struct llama_model_hyv3 : public llama_model_base {
+         graph(const llama_model & model, const llm_graph_params & params);
+     };
+ 
++    struct graph_mtp : public llm_graph_context {
++        graph_mtp(const llama_model & model, const llm_graph_params & params);
++    };
++
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+ };
+ 

@@ -1,0 +1,17 @@
+# the 85 GB model, downloaded by setup.sh
+models/
+*.gguf
+
+# the built engine, compiled by setup.sh from the tiny patches in engine/
+engine/llama.cpp-hyv3
+engine/llama.cpp-hyv3/
+
+# the agent's virtualenv and per-machine data
+sesame/.venv/
+sesame/.sesame/
+sesame/.env
+.sesame/
+
+__pycache__/
+*.pyc
+.DS_Store
