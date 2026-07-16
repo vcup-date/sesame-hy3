@@ -12,6 +12,7 @@ import os
 import queue
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -28,6 +29,7 @@ from history import validate_and_repair
 from memory import Memory, make_memory_tools
 from shell import run as shell_run, _retrying_stream, APIError
 from subagent import make_subagent_tool
+from team import Team, run_member
 import tools as toolsmod
 from tools import TOOLS
 import browser
@@ -82,10 +84,12 @@ class Loop:
         self._session_name = None
         self.goal = None             # a durable objective the agent keeps pursuing
         self.loop_job = None         # a prompt re-run on an interval
+        self.team = Team()           # named specialists that review the work between turns
         browser.STATE["headed"] = cfg.browser_headed
         log.configure(cfg.log_file)
         self.tools = (TOOLS + browser.TOOLS + make_memory_tools(self.memory)
                       + self._goal_tools()
+                      + self._team_tools()
                       + [make_subagent_tool(tools=TOOLS, api=self.cfg.api,
                                             budget=self.cfg.budget,
                                             on_event=self._sub_event)])
@@ -441,6 +445,194 @@ class Loop:
              "execute": _stop_loop},
         ]
 
+    # ── team: named specialists that review the work between turns ────────────
+    def _member_read_tools(self):
+        """What a watcher reviews with: read-only tools only, so several can run
+        in parallel over the same turn without ever clobbering each other."""
+        names = {"search", "read", "list", "browse", "websearch"}
+        return [t for t in self.tools if t["name"] in names]
+
+    def _member_full_tools(self):
+        """What an on-demand task member acts with: it runs alone, so it may write."""
+        names = {"search", "read", "list", "browse", "websearch", "write", "edit", "bash"}
+        return [t for t in self.tools if t["name"] in names]
+
+    def _member_safety(self, call):
+        """A member's tool gate. Ordinary work runs; a member never gets to run a
+        catastrophic command unattended — it is told to flag it for the lead."""
+        name, args = call["name"], call.get("input") or {}
+        checkpoint.snapshot(self.stats.turns, name, args)
+        reason = danger.check(name, args) if self.cfg.confirm_danger else None
+        if reason is None:
+            return {"allow": True}
+        if self._ln is not None and self._ln.confirm(reason, name, args):
+            return {"allow": True}
+        return {"allow": False,
+                "reason": f"a team member may not run this unattended ({reason}); "
+                          "flag it for the lead instead"}
+
+    def _review_brief(self):
+        """A compact account of what the lead just did, for a watcher to review.
+        The member has read tools and inspects the real files itself; this only
+        points it at the right place."""
+        request, actions, answer = "", [], ""
+        for m in self.messages:
+            role, content = m.get("role"), m.get("content")
+            if role == "user":
+                text = content if isinstance(content, str) else "".join(
+                    b.get("text", "") for b in (content or [])
+                    if isinstance(b, dict) and b.get("type") == "text")
+                if text.strip() and not text.startswith("["):   # skip steer/continuation notes
+                    request, actions, answer = text.strip(), [], ""   # a new request resets the window
+            elif role == "assistant" and isinstance(content, list):
+                for b in content:
+                    if b.get("type") == "tool_use":
+                        arg = b.get("input") or {}
+                        hint = arg.get("path") or arg.get("command") or arg.get("pattern") or ""
+                        actions.append(f"{b.get('name')}({str(hint)[:60]})")
+                    elif b.get("type") == "text" and b.get("text", "").strip():
+                        answer = b["text"].strip()
+        parts = [f'The lead agent just worked on this request:\n"{request[:600]}"' if request
+                 else "The lead agent just did some work."]
+        if actions:
+            shown = actions[-25:]
+            parts.append("What it did (tool calls, most recent last):\n"
+                         + "\n".join(f"- {a}" for a in shown))
+        if answer:
+            parts.append(f"What it reported:\n{answer[:800]}")
+        parts.append("Review this against your role and objective. Inspect the real result yourself.")
+        return "\n\n".join(parts)
+
+    def review_round(self, on_event=None, should_stop=None):
+        """Run every watcher over the lead's latest work, in parallel. Returns the
+        list of verdicts that raised at least one flag. should_stop() aborts a
+        member mid-run so Stop works during a review."""
+        watchers = self.team.watchers()
+        if not watchers:
+            return []
+        brief = self._review_brief()
+        base = self._member_read_tools()
+        emit = on_event or (lambda ev: None)
+
+        def one(m):
+            emit({"type": "member_start", "name": m.name, "role": m.role, "kind": "review"})
+            v = run_member(m, kind="review", brief=brief, tools=base, api=self.cfg.api,
+                           budget=self.cfg.budget, safety=self._member_safety,
+                           on_event=emit, should_stop=should_stop)
+            emit({"type": "member_done", **v})
+            return v
+
+        with ThreadPoolExecutor(max_workers=min(4, len(watchers))) as pool:
+            results = list(pool.map(one, watchers))
+        self._save()
+        return [v for v in results if v["flags"]]
+
+    def team_task(self, name, task, on_event=None, should_stop=None):
+        """Engage one member on a single-turn task, right now, with full tools."""
+        m = self.team.get(name)
+        if not m:
+            return None
+        emit = on_event or (lambda ev: None)
+        emit({"type": "member_start", "name": m.name, "role": m.role, "kind": "task"})
+        v = run_member(m, kind="task", brief=f"Task from the lead agent:\n\n{task}",
+                       tools=self._member_full_tools(), api=self.cfg.api,
+                       budget=self.cfg.budget, safety=self._member_safety, on_event=emit,
+                       should_stop=should_stop)
+        emit({"type": "member_done", **v})
+        self._save()
+        return v
+
+    def _team_tools(self):
+        """So the model can run its team from a plain prompt, not just /team."""
+        def _hire(inp):
+            role = str(inp.get("role") or "").strip()
+            if not role:
+                return {"ok": False, "content": "a role is required (what this member is for)"}
+            m = self.team.add(role, objective=str(inp.get("objective") or "").strip(),
+                              name=str(inp.get("name") or "").strip() or None)
+            self._save()
+            watch = f" Watching: {m.objective}" if m.watching else ""
+            return {"ok": True, "content": f"Hired {m.name} as: {m.role}.{watch}"}
+
+        def _fire(inp):
+            m = self.team.fire(str(inp.get("name") or ""))
+            self._save()
+            return {"ok": bool(m),
+                    "content": f"Let {m.name} go." if m else "no team member by that name"}
+
+        def _watch(inp):
+            m = self.team.get(str(inp.get("name") or ""))
+            if not m:
+                return {"ok": False, "content": "no team member by that name"}
+            obj = str(inp.get("objective") or "").strip()
+            if not obj:
+                return {"ok": False, "content": "an objective is required"}
+            m.watch(obj)
+            self._save()
+            return {"ok": True, "content": f"{m.name} is now watching after every turn: {obj}"}
+
+        def _delegate(inp):
+            name, task = str(inp.get("name") or ""), str(inp.get("task") or "").strip()
+            if not task:
+                return {"ok": False, "content": "a task is required"}
+            # a delegated member runs inside the lead's turn: honour the same Stop
+            v = self.team_task(name, task, on_event=self._sub_event,
+                               should_stop=lambda: bool(self._ln) and self._ln.stop_requested())
+            if v is None:
+                return {"ok": False, "content": "no team member by that name"}
+            flags = ("\n\nIt also flagged: "
+                     + "; ".join(f["issue"] for f in v["flags"])) if v["flags"] else ""
+            return {"ok": True, "content": f"{v['name']} reports:\n{v['summary'] or '(no report)'}{flags}"}
+
+        def _status(inp):
+            if not self.team.members:
+                return {"ok": True, "content": "the team is empty"}
+            rows = []
+            for m in self.team.members:
+                state = f"watching: {m.objective}" if m.watching else "idle"
+                rows.append(f"{m.name} — {m.role} [{state}] · {m.runs} runs, "
+                            f"{m.interventions} interventions, {len(m.memory)} notes")
+            return {"ok": True, "content": "\n".join(rows)}
+
+        return [
+            {"name": "hire", "read_only": False,
+             "description": ("Add a named specialist to your team. Give a role (what they are for). "
+                             "Optionally give an objective to make them a standing watcher who "
+                             "reviews your work after every turn. A human name is assigned."),
+             "input_schema": {"type": "object",
+                              "properties": {"role": {"type": "string"},
+                                             "objective": {"type": "string"},
+                                             "name": {"type": "string",
+                                                      "description": "optional; a name is picked if omitted"}},
+                              "required": ["role"]},
+             "execute": _hire},
+            {"name": "fire", "read_only": False,
+             "description": "Remove a team member by name.",
+             "input_schema": {"type": "object", "properties": {"name": {"type": "string"}},
+                              "required": ["name"]},
+             "execute": _fire},
+            {"name": "watch", "read_only": False,
+             "description": ("Give a team member a standing objective. From now on they review "
+                             "your work against it after every turn and flag what needs fixing."),
+             "input_schema": {"type": "object",
+                              "properties": {"name": {"type": "string"},
+                                             "objective": {"type": "string"}},
+                              "required": ["name", "objective"]},
+             "execute": _watch},
+            {"name": "delegate", "read_only": False,
+             "description": ("Hand one team member a single task to do now, with full tools. They "
+                             "act (read, edit, run commands) and report back. Use for focused work "
+                             "you want a specialist to own; use the task tool for read-only research."),
+             "input_schema": {"type": "object",
+                              "properties": {"name": {"type": "string"}, "task": {"type": "string"}},
+                              "required": ["name", "task"]},
+             "execute": _delegate},
+            {"name": "team_status", "read_only": True,
+             "description": "List your team: each member's role, whether they are watching, and their stats.",
+             "input_schema": {"type": "object", "properties": {}},
+             "execute": _status},
+        ]
+
     # ── session (markdown, append-only) ──────────────────────────────────────
     def open(self, name):
         """Name the session but do NOT create the file yet — launching sesame and
@@ -465,6 +657,8 @@ class Loop:
                     data["goal"] = self.goal.to_dict()
                 if self.loop_job:
                     data["loop"] = self.loop_job.to_dict()
+                if self.team.members:
+                    data["team"] = self.team.to_dict()
                 self.session.stats(data)
             except OSError:
                 pass
@@ -486,6 +680,7 @@ class Loop:
         self.stats = Stats(**{k: st.get(k, 0) for k in vars(Stats()) if k in st})
         self.goal = goals.Goal.from_dict(st["goal"]) if st.get("goal") else None
         self.loop_job = goals.LoopJob.from_dict(st["loop"]) if st.get("loop") else None
+        self.team = Team.from_dict(st["team"]) if st.get("team") else Team()
         if self.loop_job and self.loop_job.expired():   # a loop older than 7 days is not restored
             self.loop_job = None
         self.session = tx.Session(data["name"], self.cfg.model)
@@ -496,6 +691,7 @@ class Loop:
         self.stats = Stats()
         self.goal = None
         self.loop_job = None
+        self.team = Team()
         self.memory.clear_session()
         if self.session:
             try:

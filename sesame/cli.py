@@ -41,6 +41,7 @@ import checkpoint
 import goals
 import models
 import providers
+import team
 import transcript as tx
 from loop import Listener, Loop
 
@@ -59,6 +60,17 @@ def cyan(s): return _c("36", s)
 def yellow(s): return _c("33", s)
 def red(s): return _c("31", s)
 def magenta(s): return _c("35", s)
+
+
+# Each team member gets a stable colour from its name, so John is the same hue
+# every time he speaks — in the roster, in a review, in a report.
+_MEMBER_COLORS = ["38;5;39", "38;5;208", "38;5;141", "38;5;78", "38;5;213",
+                  "38;5;220", "38;5;44", "38;5;168", "38;5;114", "38;5;111"]
+
+
+def member_color(name):
+    code = _MEMBER_COLORS[sum(ord(c) for c in name) % len(_MEMBER_COLORS)]
+    return lambda s: _c(code, s)
 
 
 def out(s=""):
@@ -257,9 +269,12 @@ LABEL = {"bash": "Bash", "read": "Read", "write": "Write", "edit": "Edit", "list
          "search": "Search", "websearch": "WebSearch", "browse": "Fetch", "task": "Task",
          "browser_navigate": "Browser", "browser_read": "Browser", "browser_click": "Click",
          "browser_type": "Type", "browser_screenshot": "Screenshot",
-         "remember": "Remember", "forget": "Forget", "recall": "Recall"}
+         "remember": "Remember", "forget": "Forget", "recall": "Recall",
+         "set_goal": "Goal", "goal_done": "GoalDone", "set_loop": "Loop", "stop_loop": "StopLoop",
+         "hire": "Hire", "fire": "Fire", "watch": "Watch", "delegate": "Delegate",
+         "team_status": "Team"}
 PRIMARY = ["command", "path", "query", "url", "task", "pattern", "selector", "content",
-           "match", "old_string"]
+           "match", "old_string", "role", "objective", "name", "prompt"]
 
 
 def arg_of(name, args):
@@ -905,13 +920,14 @@ def paste_label(pid, text):
 COMPACT_HINT_AT = 0.85       # nudge to /compact once context passes this
 DIALOG_COMMANDS = {"/model", "/provider", "/resume", "/effort"}  # open a picker; not loopable
 
-COMMANDS = ["/help", "/goal", "/loop", "/model", "/provider", "/tools", "/undo", "/compact",
+COMMANDS = ["/help", "/goal", "/loop", "/team", "/model", "/provider", "/tools", "/undo", "/compact",
             "/effort", "/think", "/save", "/resume", "/sessions", "/memory", "/permissions",
             "/confirm", "/init", "/copy", "/clear", "/quit"]
 
 HELP_ROWS = [
     ("/goal <objective>", "keep working toward it until done  (pause | resume | clear)"),
     ("/loop <interval> <x>", "re-run a prompt or /command on an interval  (stop)"),
+    ("/team", "specialists that review the work between turns  (add | objective | task | fire)"),
     ("/model", "models, saved profiles, your own endpoint: all in one picker"),
     ("/provider", "switch provider"),
     ("/tools", "what it can do"),
@@ -965,6 +981,7 @@ class App:
         self.busy = False
         self.stop = False
         self.pending = None          # a permission question waiting on you
+        self._out_lock = threading.Lock()   # so parallel team members don't interleave their reports
         self._carry = ""             # text you had typed when the prompt restarted
         self.printer = Printer(self)
         self.show_thinking = cfg._raw.get("showThinking", False)
@@ -1185,6 +1202,11 @@ class App:
         if self.loop.loop_job:
             days = (self.loop.loop_job.expires_in() + 86399) // 86400
             info += f"  ·  ↻ loop {self.loop.loop_job.count}× ({days}d left)"
+        if self.loop.team.members:
+            watching = len(self.loop.team.watchers())
+            info += f"  ·  ⬢ team {len(self.loop.team.members)}"
+            if watching:
+                info += f" ({watching} watching)"
         hint = "esc stop · type to steer" if self.busy else "enter send · / commands"
         return FormattedText([("class:rule", "─" * self._width() + "\n"),
                               ("class:status", f"  {info}"),
@@ -1380,6 +1402,131 @@ class App:
                     out(dim(f"↻ loop #{j.count}"))
                     self._fire_loop(j.prompt)
 
+    # ── team: named specialists that review the work between turns ───────────
+    def _cmd_team(self, arg):
+        t = self.loop.team
+        parts = arg.split(None, 1)
+        sub = parts[0].lower() if parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if not sub or sub == "list":
+            self._team_roster()
+        elif sub in ("add", "hire"):
+            if not rest:
+                out(dim("who? /team add <role>   e.g. /team add UI checker")); return
+            m = t.add(rest)
+            self.loop._save()
+            col = member_color(m.name)
+            out(green(f"⬢ hired {col(bold(m.name))} as {bold(m.role)}"))
+            out(dim(f"    /team objective {m.name} <what to keep checking>   → a standing watcher"))
+            out(dim(f"    /team task {m.name} <one-off job>                   → do it once, now"))
+        elif sub in ("fire", "remove"):
+            m = t.fire(rest)
+            self.loop._save()
+            out(dim(f"let {m.name} go") if m else dim(f"no team member named {rest}"))
+        elif sub in ("objective", "watch"):
+            bits = rest.split(None, 1)
+            if len(bits) < 2:
+                out(dim("/team objective <name> <what they should keep checking>")); return
+            m = t.get(bits[0])
+            if not m:
+                out(dim(f"no team member named {bits[0]}")); return
+            m.watch(bits[1])
+            self.loop._save()
+            col = member_color(m.name)
+            out(green(f"⬢ {col(bold(m.name))} now reviews after every turn:"))
+            out(dim(f"    {bits[1]}"))
+        elif sub in ("task", "delegate"):
+            bits = rest.split(None, 1)
+            if len(bits) < 2:
+                out(dim("/team task <name> <what to do>")); return
+            m = t.get(bits[0])
+            if not m:
+                out(dim(f"no team member named {bits[0]}")); return
+            name, task = m.name, bits[1]
+            out(dim(f"⬢ {member_color(name)(name)} is on it…"))
+            self._background(f"{name} working",
+                             lambda: self.loop.team_task(name, task, on_event=self._member_event,
+                                                         should_stop=lambda: self.stop))
+        else:
+            out(dim("usage: /team [list | add <role> | objective <name> <obj> | "
+                    "task <name> <job> | fire <name>]"))
+
+    def _team_roster(self):
+        t = self.loop.team
+        if not t.members:
+            out(dim("no team yet. build one so your work gets reviewed as it happens:"))
+            out(dim("    /team add UI checker"))
+            out(dim("    /team objective <name> keep the UI aligned, nothing overflowing"))
+            return
+        watching = len(t.watchers())
+        out(f"{bold('⬢ team')}  {dim(f'· {len(t.members)} members · {watching} watching')}")
+        for m in t.members:
+            col = member_color(m.name)
+            state = green("watching") if m.watching else dim("idle")
+            out(f"  {col('⬢')} {bold(m.name)} · {m.role}  [{state}]")
+            if m.objective:
+                out(dim(f"      objective: {m.objective}"))
+            meta = f"{m.runs} reviews · stepped in {m.interventions}× · {len(m.memory)} notes"
+            if m.last:
+                meta += f" · last: {m.last[:60]}"
+            out(dim(f"      {meta}"))
+
+    def _member_event(self, ev):
+        """Render a team member's activity: spinner while it works, a report when
+        it lands. Members run in parallel during a review, so reports take a lock."""
+        if self.stop:                    # esc during a review: unwind the member's run
+            raise KeyboardInterrupt
+        t = ev.get("type")
+        if t == "member_start":
+            self.spin.update(text=f"{ev.get('name', 'member')} · {ev.get('kind', '')}…")
+        elif t == "tool_use":
+            self.spin.update(text=f"{ev.get('member', 'member')}: "
+                                  f"{LABEL.get(ev['name'], ev['name']).lower()}")
+        elif t == "member_done":
+            with self._out_lock:
+                self._member_report(ev)
+
+    def _member_report(self, v):
+        name, role = v.get("name", "member"), v.get("role", "")
+        col = member_color(name)
+        flags = v.get("flags") or []
+        head = f"{col('⬢')} {col(bold(name))} {dim('· ' + role)}"
+        if flags:
+            out(f"{head}  {yellow(f'{len(flags)} flag' + ('s' if len(flags) != 1 else ''))}")
+            for f in flags:
+                sev = f.get("severity", "normal")
+                mark = red("●") if sev == "blocker" else yellow("●") if sev == "normal" else dim("○")
+                fix = dim(f" → {f['fix']}") if f.get("fix") else ""
+                where = dim(f"  [{f['where']}]") if f.get("where") else ""
+                out(f"    {mark} {f['issue']}{fix}{where}")
+        elif v.get("cleared"):
+            out(f"{head}  {green('all clear')}")
+        else:
+            out(f"{head}  {dim(v.get('last') or 'no report')}")
+        if v.get("kind") == "task" and v.get("summary"):
+            for ln in v["summary"].splitlines():
+                out(f"    {dim(ln)}")
+
+    def _team_review(self):
+        """After a turn, every watcher inspects the work; their flags drive a
+        bounded set of follow-ups, so the lead fixes what they found."""
+        if self.stop or not self.loop.team.watchers():
+            return
+        for _ in range(team.MAX_REVIEW_ROUNDS):
+            watchers = self.loop.team.watchers()
+            out(dim(f"⬢ team review · {len(watchers)} watching"))
+            interventions = self.loop.review_round(on_event=self._member_event,
+                                                   should_stop=lambda: self.stop)
+            if self.stop:
+                return
+            if not interventions:
+                out(dim("  ✓ team: all clear"))
+                return
+            n = sum(len(v["flags"]) for v in interventions)
+            out(cyan(f"  → the lead is addressing {n} flag" + ("s" if n != 1 else "")))
+            self._run_with_steers(team.compose_review(interventions))
+        out(dim("  ⬢ team: review rounds used up for this turn"))
+
     def _run_with_steers(self, text):
         """One turn, then anything you typed while it worked, until the queue drains."""
         self.loop.run(text, self.printer)
@@ -1400,6 +1547,7 @@ class App:
                 self._run_with_steers(nxt)
                 nxt = self.loop.goal_next()
             self._report_goal()
+            self._team_review()          # the board reviews what was just done
         except KeyboardInterrupt:
             out(dim("stopped"))
             if self.loop.goal and self.loop.goal.status == "active":
@@ -1584,6 +1732,8 @@ class App:
             self._cmd_goal(arg)
         elif cmd == "/loop":
             self._cmd_loop(arg)
+        elif cmd == "/team":
+            self._cmd_team(arg)
         elif cmd == "/model":
             self._pick_model(arg)
         elif cmd == "/provider":

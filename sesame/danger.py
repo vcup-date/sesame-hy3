@@ -12,7 +12,6 @@ exactly how the prompts that matter get waved through. So the question is never
   unrecoverable   overwriting a file too big for /undo to snapshot
   sensitive       .env, *.key, *.pem, id_rsa, .netrc — even when new
   remote code     curl | sh
-  persistent      a global memory write (it enters every future system prompt)
 
 Writing files is not gated. A new file, an overwrite, an edit — all are snapshotted
 before they run, so /undo restores them, and an agent that touches many files would
@@ -59,8 +58,9 @@ _PATTERNS = [
     # remote code execution — curl was covered, wget and eval were not
     (r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?\S*(ba|z|k|fi)?sh\b", "pipes remote script to shell"),
     (r"\beval\b[^\n]*\$\(\s*(curl|wget)", "evaluates a remote script"),
-    # outward-facing / irreversible: it leaves your machine
-    (r"\bgit\s+push\b", "pushes to a remote"),
+    # outward-facing / irreversible: it leaves your machine. A plain `git push`
+    # to your own remote is routine and recoverable, so it does not prompt; the
+    # force-push above (which rewrites shared history) still does.
     (r"\b(npm|yarn|pnpm)\s+publish\b", "publishes a package"),
     (r"\btwine\s+upload\b|\bpoetry\s+publish\b", "publishes a package"),
     (r"\bdocker\s+push\b", "pushes a container image"),
@@ -216,8 +216,4 @@ def check(name, args):
                 return f"overwrites {p.name} ({mb} MB) — too large for /undo to restore"
         except OSError:
             pass
-    if name == "remember" and args.get("scope", "global") != "session":
-        return "adds a permanent item to every future system prompt"
-    if name == "forget" and args.get("scope", "global") != "session":
-        return "deletes items from permanent memory"
     return None

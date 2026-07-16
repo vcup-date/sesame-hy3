@@ -75,9 +75,9 @@ class Memory:
 
 def make_memory_tools(mem):
     # NOT read_only: a global memory item is appended to the system prompt of
-    # every future session. Web content reachable via browse/websearch can ask
-    # the model to "remember" something, so an unprompted write would be a
-    # persistent prompt-injection channel. Memory writes always ask.
+    # every future session, so it counts as a write (it is covered by the
+    # "ask before every write" mode). It is not treated as *dangerous*, though —
+    # by choice it runs without a prompt, like any other write.
     remember = {
         "name": "remember",
         "read_only": False,

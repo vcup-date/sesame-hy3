@@ -121,17 +121,16 @@ with tempfile.TemporaryDirectory() as td:
     finally:
         os.chdir(old)
 
-# danger — memory + sensitive files
-check("global remember flagged", danger.check("remember", {"content": "x"}) is not None)
-check("session remember not flagged",
-      danger.check("remember", {"content": "x", "scope": "session"}) is None)
-check("global forget flagged", danger.check("forget", {"match": "x"}) is not None)
+# danger — sensitive files. Memory writes are NOT gated (the user chose fewer
+# prompts); they just run, like any other write.
+check("remember runs without a danger prompt", danger.check("remember", {"content": "x"}) is None)
+check("forget runs without a danger prompt", danger.check("forget", {"match": "x"}) is None)
 check("edit .env flagged", danger.check("edit", {"path": "config/.env"}) is not None)
 
-# memory WRITES require approval (a global item enters every future system prompt,
-# and web content can ask for one). Reading memory back is harmless.
+# memory writes are still writes (not read_only), so "ask before every write" mode
+# still covers them; reading memory back is harmless and stays auto-allowed.
 mtools = {t["name"]: t for t in make_memory_tools(Memory())}
-check("remember/forget are not auto-allowed",
+check("remember/forget are writes (matter only under confirm-all)",
       not mtools["remember"]["read_only"] and not mtools["forget"]["read_only"])
 check("recall stays auto-allowed (read-only)", mtools["recall"]["read_only"])
 
@@ -1248,6 +1247,82 @@ _new = _goals.LoopJob(300, "x")
 check("a loop older than 7 days is expired", _old.expired())
 check("a fresh loop is not expired, ~7 days left",
       not _new.expired() and (_new.expires_in() + 86399) // 86400 == 7)
+
+# ── team: named specialists that review the lead's work between turns ────────
+import team as _team                              # noqa: E402
+import random as _random                          # noqa: E402
+
+check("pick_name returns a human name", _team.pick_name([], rng=_random.Random(1)) in _team.NAMES)
+check("pick_name avoids names already taken",
+      _team.pick_name(_team.NAMES, rng=_random.Random(2)) not in _team.NAMES)
+
+_tm = _team.Team()
+_john = _tm.add("UI checker", objective="the UI looks clean: aligned, no overflow", name="John")
+check("adding a member with an objective makes it a watcher",
+      _john.watching and _john.objective.startswith("the UI"))
+_bob = _tm.add("test runner", name="Bob")
+check("a member with no objective is idle, not watching", not _bob.watching)
+check("get is case-insensitive", _tm.get("john") is _john)
+check("watchers() returns only active watchers", _tm.watchers() == [_john])
+_bob.watch("all tests pass")
+check("watch() turns an idle member into a watcher", _bob in _tm.watchers())
+
+_john.add_note("settings panel: flex-wrap fixed the overflow")
+for _i in range(_team.MEMBER_MEMORY_MAX + 5):
+    _john.add_note(f"note {_i}")
+check("private memory is capped, keeping the most recent notes",
+      len(_john.memory) == _team.MEMBER_MEMORY_MAX and _john.memory[-1] == f"note {_team.MEMBER_MEMORY_MAX + 4}")
+
+_r = _team.Member.from_dict(_john.to_dict())
+check("a member round-trips through its dict (name, role, memory, watching)",
+      _r.name == "John" and _r.role == "UI checker"
+      and len(_r.memory) == _team.MEMBER_MEMORY_MAX and _r.watching)
+check("fire removes a member", _tm.fire("Bob") is _bob and _tm.get("Bob") is None)
+
+_iv = [{"name": "John", "role": "UI checker", "flags": [
+    {"issue": "minor spacing off", "fix": "", "where": "", "severity": "minor"},
+    {"issue": "buttons overflow", "fix": "flex-wrap", "where": "style.css:120", "severity": "blocker"}]}]
+_prompt = _team.compose_review(_iv)
+check("a review prompt puts blockers before minor issues",
+      _prompt.index("buttons overflow") < _prompt.index("minor spacing"))
+check("a review prompt carries the proposed fix and location",
+      "flex-wrap" in _prompt and "style.css:120" in _prompt)
+
+# the model-facing team tools drive the state (the "internal skill", like /goal)
+_lt = _loopmod.Loop.__new__(_loopmod.Loop)
+_lt.team = _team.Team()
+_lt.session = None
+_lt.stats = _loopmod.Stats()
+_lt.tools = [{"name": "read", "read_only": True}, {"name": "write", "read_only": False},
+             {"name": "bash", "read_only": False}]
+_tt = {t["name"]: t for t in _lt._team_tools()}
+check("the model gets hire, fire, watch, delegate, team_status tools",
+      set(_tt) == {"hire", "fire", "watch", "delegate", "team_status"})
+check("hire via the tool adds a named member",
+      _tt["hire"]["execute"]({"role": "security reviewer"})["ok"] and len(_lt.team.members) == 1)
+_who = _lt.team.members[0].name
+check("watch via the tool makes that member a watcher",
+      _tt["watch"]["execute"]({"name": _who, "objective": "no secrets in code"})["ok"]
+      and _lt.team.watchers())
+check("team_status lists the roster", _who in _tt["team_status"]["execute"]({})["content"])
+check("delegate to an unknown member fails cleanly",
+      not _tt["delegate"]["execute"]({"name": "Nobody", "task": "x"})["ok"])
+check("fire via the tool removes the member",
+      _tt["fire"]["execute"]({"name": _who})["ok"] and not _lt.team.members)
+
+check("watchers review with read-only tools only",
+      [t["name"] for t in _lt._member_read_tools()] == ["read"])
+check("a task member gets the writing tools too",
+      set(t["name"] for t in _lt._member_full_tools()) == {"read", "write", "bash"})
+
+_lt.messages = [
+    {"role": "user", "content": "make the settings panel look right"},
+    {"role": "assistant", "content": [
+        {"type": "tool_use", "name": "edit", "input": {"path": "web/static/style.css"}},
+        {"type": "text", "text": "Tightened the settings layout."}]}]
+_brief = _lt._review_brief()
+check("the review brief carries the request, the action, and the report",
+      "settings panel" in _brief and "style.css" in _brief and "Tightened" in _brief)
 
 # 10n. the /compact nudge: fires once when context passes 85%, re-arms after it drops.
 if _cli is not None:

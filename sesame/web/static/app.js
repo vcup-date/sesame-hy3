@@ -28,6 +28,17 @@ const EFFORTS = ["low", "medium", "high", "max"];
 const state = { busy: false, cfg: {}, lastId: 0, tools: new Map(), answer: null, reason: null,
                 chars: 0, streamStart: 0 };
 
+// Each team member gets one stable colour from its name, matching the terminal,
+// so John is the same hue in the roster and in every review he posts.
+const MEMBER_COLORS = ["#4aa3ff", "#ff9640", "#b98cff", "#3fca8b", "#ff7ac6",
+                       "#f4c343", "#2fc7cc", "#f2789f", "#7ac97a", "#6ab0ff"];
+const memberColor = (name) => {
+  let s = 0;
+  for (const c of String(name || "?")) s += c.charCodeAt(0);
+  return MEMBER_COLORS[s % MEMBER_COLORS.length];
+};
+const initials = (name) => String(name || "?").trim().slice(0, 1).toUpperCase();
+
 /* ── thread ─────────────────────────────────────────────────────────────── */
 const thread = $("thread");
 const scroll = $("scroll");
@@ -189,6 +200,81 @@ function askCard(ev) {
   return add(n);
 }
 
+/* ── team ───────────────────────────────────────────────────────────────── */
+function memberCard(ev) {
+  const flags = ev.flags || [];
+  const n = el("div", "member " + (flags.length ? "flagged" : ev.cleared ? "clear" : "reviewed"));
+  n.style.setProperty("--who", memberColor(ev.name));
+
+  const head = el("div", "member-head");
+  head.appendChild(el("span", "member-av", initials(ev.name)));
+  const who = el("div", "member-who");
+  who.appendChild(el("span", "member-name")).textContent = ev.name;
+  who.appendChild(el("span", "member-role")).textContent = ev.role || "";
+  head.appendChild(who);
+  head.appendChild(el("span", "member-badge")).textContent =
+    flags.length ? `${flags.length} flag${flags.length !== 1 ? "s" : ""}`
+      : ev.cleared ? "all clear" : "reviewed";
+  n.appendChild(head);
+
+  if (flags.length) {
+    const ul = el("ul", "member-flags");
+    flags.forEach((f) => {
+      const li = el("li", "sev-" + (f.severity || "normal"));
+      li.appendChild(el("span", "flag-issue")).textContent = f.issue;
+      if (f.fix) li.appendChild(el("span", "flag-fix")).textContent = " → " + f.fix;
+      if (f.where) li.appendChild(el("span", "flag-where")).textContent = f.where;
+      ul.appendChild(li);
+    });
+    n.appendChild(ul);
+  } else if (ev.kind === "task" && ev.summary) {
+    n.appendChild(el("div", "member-summary", md(ev.summary)));
+  }
+
+  const foot = el("div", "member-foot");
+  foot.textContent = `${ev.runs || 0} reviews · stepped in ${ev.interventions || 0}×`;
+  n.appendChild(foot);
+  add(n);
+}
+
+function paintTeam() {
+  const members = state.cfg.team || [];
+  const watching = members.filter((m) => m.watching).length;
+  $("teamCount").textContent = members.length
+    ? "· " + members.length + (watching ? `, ${watching} watching` : "")
+    : "";
+  const box = $("team");
+  box.innerHTML = "";
+  if (!members.length) {
+    box.appendChild(el("div", "team-empty",
+      "No one yet. Hire a specialist to review the work as it happens."));
+    return;
+  }
+  members.forEach((m) => {
+    const row = el("div", "team-row" + (m.watching ? " watching" : ""));
+    row.style.setProperty("--who", memberColor(m.name));
+    row.appendChild(el("span", "team-av")).textContent = initials(m.name);
+    const mid = el("div", "team-mid");
+    mid.appendChild(el("span", "team-name")).textContent = m.name;
+    mid.appendChild(el("span", "team-role")).textContent =
+      m.watching ? (m.objective || m.role) : m.role;
+    row.appendChild(mid);
+    const stat = el("span", "team-stat");
+    stat.title = `${m.runs} reviews · stepped in ${m.interventions}×`;
+    stat.textContent = m.watching ? `${m.interventions}×` : "idle";
+    row.appendChild(stat);
+    const x = el("button", "team-x", "✕");
+    x.title = "Fire " + m.name;
+    x.onclick = (e) => { e.stopPropagation(); api("/api/send", { text: `/team fire ${m.name}` }); };
+    row.appendChild(x);
+    // clicking a member drops a task command in the composer, ready to fill in
+    row.onclick = () => { input.value = `/team task ${m.name} `; input.focus(); grow(); };
+    box.appendChild(row);
+  });
+}
+
+$("teamAdd").onclick = () => { input.value = "/team add "; input.focus(); grow(); };
+
 /* ── events ─────────────────────────────────────────────────────────────── */
 function render(ev) {
   switch (ev.t) {
@@ -258,6 +344,14 @@ function render(ev) {
       break;
     case "error":
       add(el("div", "err", "")).textContent = ev.text;
+      break;
+
+    case "team_review":
+      add(el("div", "team-review", "")).textContent =
+        `⬢ team review · ${ev.watching} watching`;
+      break;
+    case "team_member":
+      memberCard(ev);
       break;
 
     case "busy":
@@ -615,6 +709,8 @@ function paintConfig() {
     };
     ul.appendChild(row);
   });
+
+  paintTeam();
 }
 
 function paintEffort() {

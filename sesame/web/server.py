@@ -32,6 +32,7 @@ import goals                                       # noqa: E402
 import models                                      # noqa: E402
 import project                                     # noqa: E402
 import providers                                   # noqa: E402
+import team                                        # noqa: E402
 import transcript as tx                            # noqa: E402
 from config import Config                          # noqa: E402
 from loop import Listener, Loop                    # noqa: E402
@@ -336,15 +337,115 @@ class Agent:
             prompt = bits[1] if (secs and len(bits) > 1) else arg
             self.loop.set_loop(secs or goals.DEFAULT_LOOP_SECONDS, prompt)
             return ("__run__", prompt)
+        if cmd == "/team":
+            return self._slash_team(arg)
         return None
 
+    def _slash_team(self, arg):
+        """/team from the web input: same subcommands as the terminal."""
+        t = self.loop.team
+        parts = arg.split(None, 1)
+        sub = parts[0].lower() if parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if not sub or sub == "list":
+            if not t.members:
+                return "no team yet — /team add <role> to hire a specialist"
+            return "team: " + "; ".join(
+                f"{m.name} ({m.role}{', watching' if m.watching else ''})" for m in t.members)
+        if sub in ("add", "hire"):
+            if not rest:
+                return "who? /team add <role>"
+            m = t.add(rest); self.loop._save()
+            return f"hired {m.name} as {m.role}"
+        if sub in ("fire", "remove"):
+            m = t.fire(rest); self.loop._save()
+            return f"let {m.name} go" if m else f"no member named {rest}"
+        if sub in ("objective", "watch"):
+            bits = rest.split(None, 1)
+            if len(bits) < 2:
+                return "/team objective <name> <what they should keep checking>"
+            m = t.get(bits[0])
+            if not m:
+                return f"no member named {bits[0]}"
+            m.watch(bits[1]); self.loop._save()
+            return f"{m.name} now reviews after every turn: {bits[1]}"
+        if sub in ("task", "delegate"):
+            bits = rest.split(None, 1)
+            if len(bits) < 2:
+                return "/team task <name> <what to do>"
+            m = t.get(bits[0])
+            if not m:
+                return f"no member named {bits[0]}"
+            if self.busy:
+                return "busy — let the current turn finish first"
+            name, task = m.name, bits[1]
+            self.busy, self.stop = True, False
+            self.emit({"t": "busy", "busy": True})
+            self.emit({"t": "notice", "text": f"{name} is on it…"})
+            threading.Thread(target=self._member_task, args=(name, task), daemon=True).start()
+            return None                           # already handled: a turn is running
+        return "usage: /team [list | add <role> | objective <name> <obj> | task <name> <job> | fire <name>]"
+
+    # ── team members: reviews between turns, and one-off tasks ───────────────
+    def _member_sse(self, ev):
+        """A member's shell events, translated to the browser's shapes."""
+        if self.stop:                    # stop pressed during a review: unwind the member's run
+            raise KeyboardInterrupt
+        t = ev.get("type")
+        if t == "member_start":
+            self.emit({"t": "status", "text": f"{ev.get('name', 'member')} · {ev.get('kind', '')}…"})
+        elif t == "tool_use":
+            self.emit({"t": "status",
+                       "text": f"{ev.get('member', 'member')}: "
+                               f"{LABEL.get(ev['name'], ev['name'])}"})
+        elif t == "member_done":
+            m = self.loop.team.get(ev.get("name", ""))
+            self.emit({"t": "team_member", "name": ev.get("name"), "role": ev.get("role"),
+                       "kind": ev.get("kind"), "flags": ev.get("flags") or [],
+                       "cleared": ev.get("cleared", False), "summary": ev.get("summary", ""),
+                       "runs": m.runs if m else 0,
+                       "interventions": m.interventions if m else 0})
+
+    def _member_task(self, name, task):
+        try:
+            self.loop.team_task(name, task, on_event=self._member_sse,
+                                should_stop=lambda: self.stop)
+        except Exception as exc:                  # noqa: BLE001 the UI must survive anything
+            self.emit({"t": "error", "text": str(exc)})
+        finally:
+            self.busy = False
+            self.emit({"t": "busy", "busy": False})
+            self.emit({"t": "config", **self.state()})
+            self.emit({"t": "stats", **self.stats()})
+
+    def _team_review(self):
+        """After a turn, watchers inspect the work; their flags drive bounded follow-ups."""
+        if self.stop or not self.loop.team.watchers():
+            return
+        for _ in range(team.MAX_REVIEW_ROUNDS):
+            watchers = self.loop.team.watchers()
+            self.emit({"t": "team_review", "watching": len(watchers)})
+            interventions = self.loop.review_round(on_event=self._member_sse,
+                                                   should_stop=lambda: self.stop)
+            if self.stop:
+                return
+            if not interventions:
+                self.emit({"t": "notice", "text": "team review: all clear"})
+                break
+            n = sum(len(v["flags"]) for v in interventions)
+            self.emit({"t": "notice",
+                       "text": f"team flagged {n} thing(s) — the lead is addressing them"})
+            self._run_with_steers(team.compose_review(interventions))
+        self.emit({"t": "config", **self.state()})
+
     def send(self, text):
-        if text.startswith(("/goal", "/loop")):
+        if text.startswith(("/goal", "/loop", "/team")):
             r = self._slash(text)
             if isinstance(r, tuple):              # a slash that kicks off a turn
                 text = r[1]
-            elif r is not None:
-                self.emit({"t": "notice", "text": r})
+            else:
+                if r is not None:
+                    self.emit({"t": "notice", "text": r})
                 self.emit({"t": "config", **self.state()})
                 return {"ok": True}
         if self.pending:                          # the answer to a permission question
@@ -389,6 +490,7 @@ class Agent:
                 self.emit({"t": "notice", "text": f"goal complete: {g.summary}"})
             elif g and not self.stop and g.status == "budget_limited":
                 self.emit({"t": "notice", "text": f"goal stopped after {g.turns} turns"})
+            self._team_review()                   # the board reviews what was just done
         except Exception as exc:                  # noqa: BLE001 the UI must survive anything
             self.emit({"t": "error", "text": str(exc)})
         finally:
@@ -399,6 +501,8 @@ class Agent:
             self._compact_hint()
             self.emit({"t": "busy", "busy": False})
             self.emit({"t": "stats", **self.stats()})
+            # refresh the roster: the model may have hired/fired/assigned this turn
+            self.emit({"t": "config", **self.state()})
 
     def answer(self, ask_id, verdict):
         p = self.pending
@@ -431,6 +535,7 @@ class Agent:
             "providers": providers.names(), "workdir": c.workdir,
             "projectFiles": self.loop.project_files, "git": self.loop.git,
             "permissions": self.loop.perms, "tools": [t["name"] for t in self.loop.tools],
+            "team": self.loop.team.to_dict(),
             "session": self.session_name, "title": self.title,
             "busy": self.busy, "stats": self.stats(),
             # turns() carries a Path per entry, which json will not take, and the
